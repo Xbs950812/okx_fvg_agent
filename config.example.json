@@ -1,0 +1,134 @@
+{
+  "_comment": "OKX FVG Trading Agent v3.0 — 复制为 config.json 并填入你的 API 密钥",
+  "okx": {
+    "api_key": "YOUR_API_KEY",
+    "api_secret": "YOUR_API_SECRET",
+    "passphrase": "YOUR_PASSPHRASE",
+    "base_url": "https://www.okx.com",
+    "testnet": false,
+    "demo": false,
+    "proxy": "",
+    "_proxy_comment": "国内用户需要配置代理。格式如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080，留空表示直连",
+    "_demo_comment": "将 demo 设为 true 启用模拟交易。需要先在 OKX App → 模拟交易 → API 创建模拟交易 API 密钥",
+    "demo_api_key": "YOUR_DEMO_API_KEY",
+    "demo_api_secret": "YOUR_DEMO_API_SECRET",
+    "demo_passphrase": "YOUR_DEMO_PASSPHRASE"
+  },
+  "strategy": {
+    "timeframes": ["1H", "4H"],
+    "min_fvg_width_pct": { "1H": 1.5, "4H": 3.0 },
+    "fvg_target_pct": 0.5,
+    "stop_buffer_pct": 0.15,
+    "entry_depth_pct": 0.15,
+    "abnormal_sigma": 3.0,
+    "abnormal_volume_ratio": 5.0,
+    "min_volume_24h_usd": 5000000,
+    "max_spread_pct": 0.5,
+    "max_funding_rate_abs": 0.01
+  },
+  "multi_channel": {
+    "enabled": true,
+    "channel_weights": {
+      "价格行为": 0.4, "市场结构": 0.25, "资金流向": 0.2, "市场情绪": 0.1, "宏观背景": 0.05
+    },
+    "min_confidence": 0.4,
+    "min_agreement": 0.5,
+    "debate_rounds": 2,
+    "debate_enabled": true
+  },
+  "debate_engine": {
+    "_comment": "TradingAgents (86k⭐) 多 Agent 辩论引擎",
+    "enabled": true,
+    "debate_rounds": 2,
+    "min_agreement": 0.5,
+    "checkpoint_dir": "debate_checkpoints",
+    "save_checkpoints": true
+  },
+  "alpha_zoo": {
+    "_comment": "Vibe-Trading (23.6k⭐) Alpha 因子库 + 因果滞后体制检测",
+    "enabled": true,
+    "min_factor_score": 40,
+    "backtest_window": 100,
+    "hysteresis_threshold": 0.15,
+    "min_regime_duration": 5
+  },
+  "freqai": {
+    "_comment": "freqtrade (52k⭐) FreqAI 在线学习流水线",
+    "enabled": true,
+    "feature_window": 50,
+    "retrain_interval": 10,
+    "min_prediction_confidence": -0.5
+  },
+  "hyperopt": {
+    "_comment": "freqtrade (52k⭐) 参数优化 + Kelly 仓位",
+    "enabled": true,
+    "optimize_interval_rounds": 50,
+    "n_initial": 5,
+    "n_refine": 3,
+    "walk_forward_windows": 5
+  },
+  "optimization": {
+    "adaptive_enabled": true,
+    "trailing_stop_enabled": true,
+    "trailing_stop_activation_pct": 0.5,
+    "trailing_stop_trail_pct": 0.3,
+    "edge_lookback": 100,
+    "consecutive_loss_pause": 5,
+    "consecutive_loss_derate": 3
+  },
+  "risk": {
+    "risk_per_trade_pct": 1.0,
+    "max_leverage": 10,
+    "margin_mode": "isolated",
+    "margin_pct": 30,
+    "profit_withdrawal_pct": 25,
+    "max_positions": 1,
+    "max_daily_loss_pct": 10,
+    "max_exposure_pct": 30
+  },
+  "memory": {
+    "enabled": true,
+    "memory_dir": "memory",
+    "reflection_interval_trades": 10,
+    "half_life_days": 30,
+    "archive_threshold": 0.1
+  },
+  "coin_tracker": {
+    "_comment": "币种追踪研究 — 闲置时间持续研究，不等建仓才分析",
+    "enabled": true,
+    "refresh_interval_seconds": 120,
+    "candle_refresh_seconds": 60,
+    "coin_list_refresh_seconds": 300,
+    "research_batch_size": 8,
+    "batch_cooldown_seconds": 1.5,
+    "max_cache_entries": 500,
+    "research_ttl_seconds": 300,
+    "candle_ttl_seconds": 60,
+    "warmup_top_n": 100
+  },
+  "report": {
+    "_comment": "定时研究报告 — 亚洲/欧美时段转换时生成报告",
+    "enabled": true,
+    "top_n_display": 30,
+    "session_times": ["08:00", "15:00", "20:00"],
+    "report_dir": "reports",
+    "email": {
+      "enabled": false,
+      "smtp_host": "smtp.qq.com",
+      "smtp_port": 465,
+      "smtp_ssl": true,
+      "sender": "your_email@qq.com",
+      "password": "YOUR_SMTP_AUTH_CODE",
+      "recipients": ["your_email@qq.com"]
+    }
+  },
+  "agent": {
+    "scan_interval_seconds": 300,
+    "coin_scan_limit": 100,
+    "dry_run": false,
+    "log_level": "INFO",
+    "log_file": "agent.log",
+    "aggressiveness": 3,
+    "_aggressiveness_comment": "研判挡位: 1=激进(每天必找一币), 2=均衡(2-3天一笔), 3=保守(默认)"
+  }
+}
