@@ -2,6 +2,26 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-08] FVG Hunter 硬门禁（只吃确定性极端行情）
+
+### 策略 Alpha 升级（源自 4 小时横盘监控复盘）
+ADA 入场后 4h 横盘 0.1987~0.2001（±0.35%），触发不了任何退出逻辑，空耗保证金。
+结论：横盘折磨行情不该入场，FVG Hunter 只吃确定性极端行情（上涨下跌都很大的）。
+
+### 实现
+- `_extreme_move_reject_reason`：per-symbol 硬门禁，`generate_signal` 过滤器链第 0.75 位
+  - ADX(14) ≥ 25：趋势强度（Wilder 1978 行业标准，与 `adx_trend_threshold` 同值，
+    趋势市 FVG 回补有效 / 震荡市假回补风险高）
+  - ATR(14)/现价 ≥ 2%：单根 K 线平均振幅（"上涨下跌都很大"）
+  - 任一不满足 → `[ExtremeMove] 横盘/低波动拒绝`，信号直接否决
+  - K 线不足自动 fail-open（防新币阻塞，与 ATRGrade 同策略）
+- 参数可配置：`strategy.extreme_move_min_adx` / `extreme_move_min_atr_pct`（0=关闭）
+
+### 验证
+- 新增回归 `test_extreme_move_gate`：横盘(低ADX)拒绝 / 强趋势+高波动放行 /
+  数据不足放行 / 门禁关闭放行
+- 回归 8/8 + `tests/` 48/48 全过
+
 ## [2026-08-08] 纸面监控批次修复（满杠杆测试 + 4 项监控发现）
 
 源自 30 USDT 纸面监控会话（1x 挡位 → 满杠杆 30% 仓位）的修复。

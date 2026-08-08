@@ -231,6 +231,46 @@ def test_paper_trailing_moves_sl():
         assert pos.sl_px == old_sl, "SL 不得向不利方向放松"
 
 
+def _make_choppy_candles(n=60):
+    """交替 ±1% 无趋势震荡 → ADX 低 (Wilder 方向性指标近零)。"""
+    out, px = [], 100.0
+    for i in range(n):
+        px = px * (1.01 if i % 2 == 0 else 0.99)
+        out.append(Candle(timestamp=i, open=px * 0.995,
+                          high=px * 1.015, low=px * 0.985, close=px, volume=10))
+    return out
+
+
+def _make_trend_candles(n=60):
+    """单边 +2%/根 强趋势 → ADX 高 + ATR%≈3% (极端行情)。"""
+    out, px = [], 100.0
+    for i in range(n):
+        px = px * 1.02
+        out.append(Candle(timestamp=i, open=px * 0.99,
+                          high=px * 1.01, low=px * 0.99, close=px, volume=10))
+    return out
+
+
+def test_extreme_move_gate():
+    """FVG Hunter 硬门禁 (2026-08-08): 横盘拒绝 / 极端放行 / 数据不足 fail-open。"""
+    from strategy import _extreme_move_reject_reason
+    # 横盘震荡 (ADX 低) → 拒绝 (ATR%≈3% 达标, ADX 不达标)
+    choppy = _make_choppy_candles()
+    r = _extreme_move_reject_reason(choppy, 100.0, 14, 25.0, 2.0)
+    assert r is not None and "ADX" in r, f"横盘应被 ADX 否决, 实际 {r!r}"
+    # 强趋势 + 高波动 → 放行
+    trend = _make_trend_candles()
+    last_px = 100.0 * (1.02 ** 59)
+    r2 = _extreme_move_reject_reason(trend, last_px, 14, 25.0, 2.0)
+    assert r2 is None, f"强趋势极端行情应放行, 实际 {r2!r}"
+    # 数据不足 → fail-open 放行 (防新币阻塞)
+    r3 = _extreme_move_reject_reason(_make_choppy_candles(10), 100.0, 14, 25.0, 2.0)
+    assert r3 is None, "K线不足应 fail-open 放行"
+    # 门禁关闭 (0) → 恒放行
+    r4 = _extreme_move_reject_reason(choppy, 100.0, 14, 0.0, 0.0)
+    assert r4 is None, "门禁关闭时应放行"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

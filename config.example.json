@@ -24,7 +24,9 @@
     "abnormal_volume_ratio": 5.0,
     "min_volume_24h_usd": 5000000,
     "max_spread_pct": 0.5,
-    "max_funding_rate_abs": 0.01
+    "max_funding_rate_abs": 0.01,
+    "extreme_move_min_adx": 25,
+    "extreme_move_min_atr_pct": 2.0
   },
   "multi_channel": {
     "enabled": true,

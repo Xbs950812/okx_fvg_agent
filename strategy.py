@@ -766,6 +766,44 @@ def _compute_adx(
     return adx, pdi, ndi
 
 
+def _extreme_move_reject_reason(
+    candles: Optional[List[Candle]],
+    current_price: float,
+    atr_period: int = 14,
+    min_adx: float = 0.0,
+    min_atr_pct: float = 0.0,
+) -> Optional[str]:
+    """FVG Hunter 硬门禁 — 只吃确定性极端行情 (2026-08-08 横盘监控复盘)。
+
+    横盘折磨行情 (低 ADX 无趋势 或 低 ATR 波动太小) 里 FVG 回补易被噪音扫掉,
+    入场后长时间无方向空耗 (实测 ADA 4h 横盘 0.1987~0.2001, ±0.35%)。
+
+    判定标准 (行业标准, 非凭空参数):
+      - ADX(14) ≥ min_adx: 趋势强度。Wilder 1978: >25 趋势市(FVG回补有效)/
+        <20 震荡市(假回补风险高), 与 adx_trend_threshold 同值。
+      - ATR(14)/现价 ≥ min_atr_pct: 单根 K 线平均振幅, 保证"上涨下跌都很大"。
+
+    Returns:
+        拒绝原因字符串 (含 ADX/ATR% 实测值) 或 None (放行)。
+        数据不足时 fail-open 放行 (防新币/数据缺失阻塞, 与 ATRGrade 同策略)。
+    """
+    if min_adx <= 0 and min_atr_pct <= 0:
+        return None  # 门禁关闭
+    if not candles or len(candles) < atr_period * 2:
+        return None  # fail-open: K线不足不做裁决
+    reasons = []
+    _adx = _compute_adx(candles, period=atr_period)
+    _adx_val = _adx[0] if _adx else None
+    if _adx_val is not None and min_adx > 0 and _adx_val < min_adx:
+        reasons.append(f"ADX={_adx_val:.0f}<{min_adx:.0f}(横盘无趋势)")
+    _atr = _compute_atr_wilder(candles, atr_period)
+    _atr_pct = (_atr / current_price * 100.0) \
+        if (_atr > 0 and current_price > 0) else 0.0
+    if min_atr_pct > 0 and _atr_pct < min_atr_pct:
+        reasons.append(f"ATR%={_atr_pct:.2f}<{min_atr_pct:.2f}(波动太小)")
+    return "; ".join(reasons) if reasons else None
+
+
 def _compute_vwap(candles: List[Candle]) -> Optional[float]:
     """当日锚定 VWAP（从最后一根K线的自然日 0 点开始累计）。
 
@@ -1280,6 +1318,12 @@ def generate_signal(
     # 修复(5400缺口研究/2026-08-07): A级(≥1×ATR)持仓率53%/+0.48R期望, B级(≥0.5×ATR)
     # ~32%/~0EV, C级(<0.5×ATR)仅20%/-0.34R 是负期望陷阱。0=关闭分级。
     min_fvg_atr_ratio: float = 0.0,
+    # FVG Hunter 硬门禁 (2026-08-08): 只吃确定性极端行情 —
+    # 横盘折磨行情(低 ADX 无趋势 或 低 ATR 波动太小)直接否决入场。
+    # 行业标准: ADX≥25 趋势市(Wilder 1978, 与 adx_trend_threshold 同值);
+    # ATR%≥min 保证单根 K 线平均振幅够大。0=关闭门禁。
+    extreme_move_min_adx: float = 0.0,
+    extreme_move_min_atr_pct: float = 0.0,
     # 职业交易标准 (ATR 动态止损): 止损距离不得小于 ATR(14)×atr_stop_multiplier，
     # 异常波动币自动放宽，避免固定百分比止损被正常噪音扫掉
     # (SAHARA 1.08% 止损 9x 杠杆被扫 -15.24 的教训)。
@@ -1349,6 +1393,20 @@ def generate_signal(
                 return None
         else:
             logger.debug(f"[ATRGrade] {inst_id} ATR 数据不足({len(candles) if candles else 0}根)，跳过分级")
+
+    # ---- 过滤器 0.75: FVG Hunter 硬门禁 (只吃确定性极端行情) ----
+    # 2026-08-08 横盘监控复盘: ADA 4h 横盘 0.1987~0.2001 (±0.35%) 入场后
+    # 空耗 4 小时无方向。横盘折磨行情 FVG 回补易被噪音扫掉, 直接否决入场。
+    # ADX≥25 趋势市 + ATR%≥min 波动(上涨下跌都很大) 才放行; 数据不足 fail-open。
+    if extreme_move_min_adx > 0 or extreme_move_min_atr_pct > 0:
+        _em_reason = _extreme_move_reject_reason(
+            candles, current_price, atr_period,
+            extreme_move_min_adx, extreme_move_min_atr_pct)
+        if _em_reason:
+            logger.info(
+                f"[ExtremeMove] {inst_id} {fvg.timeframe} 横盘/低波动拒绝: "
+                f"{_em_reason} (FVG Hunter 只吃确定性极端行情)")
+            return None
 
     # ---- 过滤器 1: 资金费率 ----
     # 修复 C4: 方向感知过滤 — 做多只过滤正费率（你支付），做空只过滤负费率（你支付）
@@ -1907,6 +1965,8 @@ def scan_fvg_all_timeframes(
             min_risk_reward=float(strategy_cfg.get("min_risk_reward", 0.0)),
             max_fvg_age_bars=int(strategy_cfg.get("max_fvg_age_bars", 24)),
             min_fvg_atr_ratio=float(strategy_cfg.get("min_fvg_atr_ratio", 0.0)),
+            extreme_move_min_adx=float(strategy_cfg.get("extreme_move_min_adx", 0.0)),
+            extreme_move_min_atr_pct=float(strategy_cfg.get("extreme_move_min_atr_pct", 0.0)),
             atr_period=int(strategy_cfg.get("atr_period", 14)),
             atr_stop_multiplier=float(strategy_cfg.get("atr_stop_multiplier", 2.0)),
             atr_reject_ratio=float(strategy_cfg.get("atr_reject_ratio", 0.8)),
