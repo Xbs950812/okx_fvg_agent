@@ -4156,6 +4156,7 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                                         "regime_corr_window", 60),
                                     smooth_window=az_cfg.get(
                                         "regime_smooth_window", 5),
+                                    symbol=inst_id,
                                 ),
                             ).update(
                                 correlation=corr,
@@ -4902,6 +4903,28 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 )
             except Exception as _ml_e:
                 logger.warning(f"[ML] {best_signal.inst_id} ML过滤异常，放行: {_ml_e}")
+
+        # 修复 2026-08-08: 纸面模式源头去重 — 该币种已有纸面挂单/持仓时,
+        # 跳过本轮执行。dry-run 下 get_pending_orders 恒为空, manage_pending
+        # _orders 去重失效, 同一信号每轮重复走 execute_signal 假单路径 →
+        # positions_opened 虚增 + 重复假单噪音; 纸面引擎内部虽有去重, 但
+        # 在入口拦截才能保住记账与日志干净。
+        if paper_engine is not None:
+            try:
+                if paper_engine.has_position(best_signal.inst_id):
+                    logger.info(
+                        f"[Paper] {best_signal.inst_id} 已有纸面挂单/持仓，"
+                        f"跳过重复执行")
+                    state_manager.save()
+                    if once:
+                        break
+                    if tracker:
+                        tracker.resume()
+                    elapsed = time.time() - round_start
+                    time.sleep(max(0, scan_interval - elapsed))
+                    continue
+            except Exception:
+                pass
 
         inst_info = client.get_instrument_info(best_signal.inst_id)
         ord_id = None  # 修复: 显式初始化，避免 inst_info 为 None 时下方 if ord_id 抛 UnboundLocalError

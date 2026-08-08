@@ -193,6 +193,44 @@ def test_paper_leverage_cap_consistency():
         assert abs(notional - 30.0) < 1e-6, f"1x 下名义仓位应=保证金 30, 实际 {notional:.2f}"
 
 
+def test_paper_trailing_moves_sl():
+    """纸面移动止损 (2026-08-08): ATR 激活后 SL 只向有利方向收紧。
+
+    回归: 纸面模式此前不模拟移动止损, trailing 只走 dry-run 假单,
+    纸面 SL 恒为信号固定值 → 纸面无法验证追踪止损行为。
+    """
+    from paper_trading import PaperTradingEngine
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 1, "max_positions": 1,
+                     "max_hold_hours": 48},
+            "optimization": {"trailing_stop_activation_pct": 0.5,
+                             "trailing_stop_trail_pct": 0.03},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=98.5, tp=104.0, leverage=1)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True  # 直接置为已成交，跳过挂单流程
+        # K线: high=100.5 low=100.0 → TR=0.5, ATR(14)=0.5
+        candles = [{"high": 100.5, "low": 100.0, "close": 100.3, "ts": i}
+                   for i in range(20)]
+        # mark=100.4, 涨幅 0.4 ≥ ATR×0.5=0.25 → 激活
+        eng._update_trailing(pos, {"mark": 100.4, "candles": candles})
+        assert pos.extra.get("ts_activated") is True, "价格越 0.5xATR 应激活"
+        # best=100.4, trail=0.75×ATR=0.375 → new_sl=100.025 > 98.5
+        assert pos.sl_px > 98.5, f"SL 应上移, 实际 {pos.sl_px:.4f}"
+        # 价格回落到 100.1 → 高水位不变, SL 不得放松
+        old_sl = pos.sl_px
+        eng._update_trailing(pos, {"mark": 100.1, "candles": candles})
+        assert pos.sl_px == old_sl, "SL 不得向不利方向放松"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

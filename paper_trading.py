@@ -100,6 +100,33 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAKER_FEE = 0.0002   # OKX 永续 maker 常见费率 0.02%
 _DEFAULT_TAKER_FEE = 0.0005   # OKX 永续 taker 常见费率 0.05%
 _SL_SLIPPAGE = 0.005          # 止损滑点，与 executor.execute_signal 的 _sl_slippage 一致
+_ATR_PERIOD = 14              # 纸面移动止损 ATR 周期，与实盘 _compute_atr_from_cache 一致
+
+
+def _atr14(candles: List[dict]) -> float:
+    """Wilder 平滑 ATR(14) — 与实盘 ATR 计算口径一致。
+
+    数据不足时返回 0.0，调用方回退固定百分比追踪。
+    """
+    try:
+        if not isinstance(candles, list) or len(candles) < _ATR_PERIOD + 1:
+            return 0.0
+        highs = [float(c["high"]) for c in candles[-(_ATR_PERIOD + 1):]]
+        lows = [float(c["low"]) for c in candles[-(_ATR_PERIOD + 1):]]
+        closes = [float(c["close"]) for c in candles[-(_ATR_PERIOD + 1):]]
+        trs = []
+        for i in range(1, len(closes)):
+            trs.append(max(highs[i] - lows[i],
+                           abs(highs[i] - closes[i - 1]),
+                           abs(lows[i] - closes[i - 1])))
+        if len(trs) < _ATR_PERIOD:
+            return 0.0
+        atr = sum(trs[:_ATR_PERIOD]) / float(_ATR_PERIOD)
+        for t in trs[_ATR_PERIOD:]:
+            atr = (atr * (_ATR_PERIOD - 1) + t) / float(_ATR_PERIOD)
+        return float(atr)
+    except (TypeError, ValueError, KeyError, IndexError):
+        return 0.0
 
 
 @dataclass
@@ -145,6 +172,14 @@ class PaperTradingEngine:
         # 按当前标记价模拟市价成交，保证能测到完整交易闭环(开仓→保护→追踪→平仓)。
         # 0 表示关闭该兜底，仅靠自然回补成交。
         self.fill_assist_s: float = float(pcfg.get("fill_assist_seconds", 0))
+        # 纸面移动止损(2026-08-08 补齐): 与实盘 optimization.TrailingStop 同参 —
+        # 激活阈值/追踪距离基于 ATR 动态计算, 无 ATR 时回退固定百分比。
+        ocfg = config.get("optimization", {}) if isinstance(config, dict) else {}
+        self.ts_activation_pct: float = float(
+            ocfg.get("trailing_stop_activation_pct", 0.5))
+        self.ts_trail_pct: float = float(ocfg.get("trailing_stop_trail_pct", 0.03))
+        self.ts_atr_activation_mult: float = 0.5    # 0.5x ATR ≈ 1% 价格移动
+        self.ts_atr_trail_mult: float = 0.75        # 0.75x ATR ≈ 1.5% 追踪距离
         self.max_hold_hours: float = float(rcfg.get("max_hold_hours", 48))
         self.dynamic_roi: Dict[str, float] = dict(
             rcfg.get("dynamic_roi", {"240": 0.015, "120": 0.025, "60": 0.035, "0": 0.05})
@@ -316,6 +351,9 @@ class PaperTradingEngine:
                     exit_px, reason = exit_info
                     self._close_locked(pos, exit_px, reason)
                     continue
+                # 移动止损 (2026-08-08): 纸面持仓 SL 与实盘 trailing 同步抬升,
+                # 验证追踪止损行为; 只在未触发退出时更新。
+                self._update_trailing(pos, md)
                 if md.get("mark") is not None:
                     pos.last_mark = float(md["mark"])
             self.save()
@@ -365,6 +403,83 @@ class PaperTradingEngine:
             del self._positions[pos.inst_id]
             logger.info(f"[Paper] {pos.inst_id} 纸面限价单 {pos.entry_px:.6g} "
                         f"超时未成交，取消")
+
+    def has_position(self, inst_id: str) -> bool:
+        """是否已有该币种的纸面挂单/持仓（含未成交限价单）。
+
+        2026-08-08: 供主循环在 execute_signal 前做源头去重，避免纸面模式下
+        dry-run 假单路径每轮重复执行同一信号（positions_opened 虚增噪音）。
+        """
+        with self._lock:
+            return inst_id in self._positions
+
+    def _update_trailing(self, pos: PaperPosition, md: Dict[str, Any]) -> None:
+        """纸面移动止损 — 与实盘 optimization.TrailingStop 同逻辑。
+
+        激活: 价格朝有利方向移动 ≥ ATR×0.5 (无 ATR 时按 TP 距离×activation_pct);
+        追踪: 止损 = 新高/新低 − ATR×0.75 (无 ATR 时 −entry×trail_pct)。
+        只允许向有利方向收紧 sl_px，状态持久化于 pos.extra。
+        """
+        mark = md.get("mark")
+        if mark is None:
+            return
+        try:
+            mark = float(mark)
+        except (TypeError, ValueError):
+            return
+        if mark <= 0 or pos.entry_px <= 0:
+            return
+        atr = _atr14(md.get("candles") or [])
+        best = float(pos.extra.get("ts_best", 0.0) or 0.0)
+        activated = bool(pos.extra.get("ts_activated", False))
+        if pos.side == "long":
+            if not activated:
+                if atr > 0:
+                    ok = (mark - pos.entry_px) >= atr * self.ts_atr_activation_mult
+                else:
+                    tp_dist = pos.tp_px - pos.entry_px
+                    ok = (tp_dist > 0 and
+                          (mark - pos.entry_px) / tp_dist >= self.ts_activation_pct)
+                if ok:
+                    activated = True
+                    best = mark
+            if activated:
+                if mark > best:
+                    best = mark
+                trail = (atr * self.ts_atr_trail_mult if atr > 0
+                         else pos.entry_px * self.ts_trail_pct)
+                new_sl = best - trail
+                if new_sl > pos.sl_px:
+                    logger.info(
+                        f"[Paper-TS] {pos.inst_id} long 追踪止损 "
+                        f"{pos.sl_px:.6g} → {new_sl:.6g} "
+                        f"(best={best:.6g} atr={atr:.4g})")
+                    pos.sl_px = new_sl
+        else:  # short
+            if not activated:
+                if atr > 0:
+                    ok = (pos.entry_px - mark) >= atr * self.ts_atr_activation_mult
+                else:
+                    tp_dist = pos.entry_px - pos.tp_px
+                    ok = (tp_dist > 0 and
+                          (pos.entry_px - mark) / tp_dist >= self.ts_activation_pct)
+                if ok:
+                    activated = True
+                    best = mark
+            if activated:
+                if mark < best or best <= 0:
+                    best = mark
+                trail = (atr * self.ts_atr_trail_mult if atr > 0
+                         else pos.entry_px * self.ts_trail_pct)
+                new_sl = best + trail
+                if new_sl < pos.sl_px:
+                    logger.info(
+                        f"[Paper-TS] {pos.inst_id} short 追踪止损 "
+                        f"{pos.sl_px:.6g} → {new_sl:.6g} "
+                        f"(best={best:.6g} atr={atr:.4g})")
+                    pos.sl_px = new_sl
+        pos.extra["ts_best"] = best
+        pos.extra["ts_activated"] = activated
 
     def _fill_locked(self, pos: PaperPosition, md: Dict[str, Any],
                      assist: bool = False) -> None:

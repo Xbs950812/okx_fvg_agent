@@ -448,6 +448,7 @@ class CoinTracker(threading.Thread):
                 exit_threshold=getattr(proto, "exit_threshold", 0.45),
                 corr_window=getattr(proto, "corr_window", 60),
                 smooth_window=getattr(proto, "smooth_window", 5),
+                symbol=inst_id,
             )
             self._regime_detector_map[inst_id] = det
         return det
@@ -780,6 +781,7 @@ def warmup_research(
                             regime_detector, "corr_window", 60),
                         smooth_window=getattr(
                             regime_detector, "smooth_window", 5),
+                        symbol=inst_id,
                     )
                     _reg_map[inst_id] = _det
             analysis, detected_regime = _perform_coin_research(

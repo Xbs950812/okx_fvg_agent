@@ -214,7 +214,10 @@ class EnhancedRegimeDetector:
         hysteresis_threshold: float = 0.15,
         min_regime_duration: int = 5,
         max_history: int = 500,
+        symbol: str = "",
     ):
+        # 2026-08-08: 币种标识用于切换日志定位（per-symbol 实例下必须可区分）
+        self.symbol = symbol
         self.enter_threshold = enter_threshold
         self.exit_threshold = exit_threshold
         self.corr_window = corr_window
@@ -516,7 +519,8 @@ class EnhancedRegimeDetector:
         self.state.regime_duration = 0
 
         logger.info(
-            "Regime transition: %s -> %s (transition #%d, duration=%d)",
+            "[%s] Regime transition: %s -> %s (transition #%d, duration=%d)",
+            self.symbol or "?",
             old_regime.value,
             new_regime.value,
             self.state.transition_count,
@@ -618,6 +622,7 @@ class CausalHysteresisRegime(EnhancedRegimeDetector):
         exit_threshold: float = 0.45,
         corr_window: int = 60,
         smooth_window: int = 5,
+        symbol: str = "",
     ):
         super().__init__(
             hysteresis_threshold=hysteresis_threshold,
@@ -627,4 +632,5 @@ class CausalHysteresisRegime(EnhancedRegimeDetector):
             exit_threshold=exit_threshold,
             corr_window=corr_window,
             smooth_window=smooth_window,
+            symbol=symbol,
         )

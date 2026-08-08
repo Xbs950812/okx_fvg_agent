@@ -2,6 +2,33 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-08] 纸面监控批次修复（满杠杆测试 + 4 项监控发现）
+
+源自 30 USDT 纸面监控会话（1x 挡位 → 满杠杆 30% 仓位）的修复。
+
+### 满杠杆测试配置
+- `max_position_leverage` 1→5：恢复"满杠杆"档位（杠杆由 25/止损距离% 预算公式给出，5x 专业封顶）
+- `risk_per_trade_pct` 1→2：允许 30% 保证金仓位在常见止损距离（SL≤6.6%）下足额使用，
+  仍在社区铁律 1-2% 上限内，`enforce_risk_cap` 机制保持生效
+- 其余 70% 余额自动作为保证金缓冲（isolated 模式可用保证金）
+
+### 监控发现修复（4 项）
+- **纸面移动止损缺失**：paper_trading 新增 `_update_trailing`（ATR(14) 动态激活 0.5x/
+  追踪 0.75x，无 ATR 回退固定百分比），纸面 SL 与实盘 trailing 同步收紧、只松不紧、
+  状态持久化于 pos.extra；与实盘 `optimization.TrailingStop` 同参同逻辑
+- **纸面重复执行噪音**：主循环在 execute_signal 前用 `paper_engine.has_position()`
+  源头去重 — dry-run 下 `get_pending_orders` 恒空导致同一信号每轮重复走假单路径，
+  `positions_opened` 虚增
+- **纸面杠杆口径**（续）：纸面开仓应用 `max_position_leverage` 封顶后计算仓位（上批
+  已修，本批补回归测试）
+- **体制切换日志无币种**：`EnhancedRegimeDetector` 增加 `symbol` 参数，切换日志
+  前缀 `[币种]`（per-symbol 实例可区分）；coin_tracker/主循环创建点透传 inst_id
+
+### 验证
+- 回归测试 7/7 通过（新增 `test_paper_trailing_moves_sl`：ATR 激活后 SL 上移且不放松）
+- `tests/` 48 项单测全部通过
+- 变更文件：agent.py / paper_trading.py / regime_detector.py / coin_tracker.py / config.json / test_production_fixes.py
+
 ## [2026-08-07] 生产级审计修复批次（P0 全部 + P1 全部 + 关键 P2）
 
 基于完整生产审计（覆盖执行层/资金管理/状态恢复/策略/回测）落地的修复。
