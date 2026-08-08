@@ -271,6 +271,47 @@ def test_extreme_move_gate():
     assert r4 is None, "门禁关闭时应放行"
 
 
+class _FakeAnalysis:
+    """最小分析对象：final_score + final_confidence + channel_agreement。"""
+    def __init__(self, final_score, final_confidence=0.5, channel_agreement=0.6):
+        self.final_score = final_score
+        self.final_confidence = final_confidence
+        self.channel_agreement = channel_agreement
+
+
+class _FakeCacheEntry:
+    """最小缓存条目：inst_id + signals + analysis + funding_rate。"""
+    def __init__(self, inst_id, signals, analysis, funding_rate=0.0):
+        self.inst_id = inst_id
+        self.signals = signals
+        self.analysis = analysis
+        self.funding_rate = funding_rate
+
+
+def test_switch_candidate_skips_gate_rejected():
+    """预换仓候选 (2026-08-08): 无有效 FVG 信号的缓存条目不得参与换仓。
+
+    回归: PIPPIN 实测 — 4H ADX=13 横盘，全部信号被 ExtremeMove 门禁拒绝
+    (signals=[])，但研究分 final_score=+1.00 仍混入换仓候选，产生噪音
+    决策。修复后候选选择与主扫描路径口径一致：只认真实 FVG 信号。
+    """
+    from agent import _pick_switch_candidate
+    # 横盘币: 研究分虚高 +1.00 但信号已被门禁拒绝 (signals=[])
+    rejected = _FakeCacheEntry("PIPPIN-USDT-SWAP", [], _FakeAnalysis(1.00))
+    # 有效信号币: 分 0.80，有真实 FVG 信号
+    valid = _FakeCacheEntry("WIF-USDT-SWAP", [_make_signal("WIF-USDT-SWAP")],
+                            _FakeAnalysis(0.80))
+    best = _pick_switch_candidate([(rejected, {}), (valid, {})], {})
+    assert best is not None, "有效信号候选应被选中"
+    assert best[0].inst_id == "WIF-USDT-SWAP", \
+        "横盘无信号条目必须被排除, 不得抢占换仓候选"
+    # 全部无信号 → 无候选 (不触发换仓)
+    assert _pick_switch_candidate([(rejected, {})], {}) is None
+    # 持仓中的币不参与候选
+    assert _pick_switch_candidate(
+        [(valid, {})], {"WIF-USDT-SWAP": {"size": 1}}) is None
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

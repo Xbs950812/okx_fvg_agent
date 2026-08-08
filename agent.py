@@ -393,6 +393,45 @@ def _switch_guards(
     return True, ""
 
 
+def _pick_switch_candidate(
+    cached_signals: list, positions: dict
+) -> Optional[Tuple[Any, dict]]:
+    """从缓存候选中选出换仓目标（跳过无有效 FVG 信号的条目）。
+
+    候选选择与换仓比较统一使用 final_score — 原实现按 final_confidence 选
+    最优但按 final_score 比较，度量不一致导致"选中置信度高但评分未必高"的
+    标的反复触发换仓。
+
+    FVG Hunter 硬门禁一致性 (2026-08-08): 缓存研究分(final_score)可能虚高
+    但信号已被 ExtremeMove/宽度/新鲜度门禁拒绝 (PIPPIN 实测: 研究分 +1.00
+    但 4H ADX=13 全部信号被拒，仍混入换仓候选)。无有效 FVG 信号的条目
+    不得参与换仓 — 与主扫描路径 (all_signals.extend(entry.signals)) 口径
+    一致，杜绝横盘币绕门禁入场。
+
+    Returns:
+        (entry, coin_info) 或 None（无合格候选）
+    """
+    _best_cached = None
+    _best_cached_score = -999.0
+    for _cached_entry, _cached_coin_info in (cached_signals or []):
+        if _cached_entry.inst_id in positions:
+            continue
+        if not _cached_entry.signals:
+            logger.debug(
+                f"[Switch] {_cached_entry.inst_id} 无有效 FVG 信号"
+                f"(门禁已拒绝)，排除换仓候选")
+            continue
+        _cand_score = (
+            _cached_entry.analysis.final_score
+            if _cached_entry.analysis and _cached_entry.analysis.final_score
+            else 0.0
+        )
+        if _cand_score > _best_cached_score:
+            _best_cached_score = _cand_score
+            _best_cached = (_cached_entry, _cached_coin_info)
+    return _best_cached
+
+
 def _weak_signal_multi_gate(
     config: dict,
     client: Any,
@@ -3088,19 +3127,9 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
             # 修复: 候选选择与换仓比较统一使用 final_score — 原实现按
             # final_confidence 选最优但按 final_score 比较，度量不一致导致
             # "选中置信度高但评分未必高"的标的反复触发换仓。
-            _best_cached = None
-            _best_cached_score = -999.0
-            for _cached_entry, _cached_coin_info in (_cached_signals or []):
-                if _cached_entry.inst_id in positions:
-                    continue
-                _cand_score = (
-                    _cached_entry.analysis.final_score
-                    if _cached_entry.analysis and _cached_entry.analysis.final_score
-                    else 0.0
-                )
-                if _cand_score > _best_cached_score:
-                    _best_cached_score = _cand_score
-                    _best_cached = (_cached_entry, _cached_coin_info)
+            # 候选选择同时排除无有效 FVG 信号的条目 (FVG Hunter 硬门禁一致性，
+            # 见 _pick_switch_candidate)。
+            _best_cached = _pick_switch_candidate(_cached_signals, positions)
 
             if _best_cached:
                 _entry, _coin_info = _best_cached

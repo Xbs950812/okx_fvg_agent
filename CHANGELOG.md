@@ -2,6 +2,25 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-08] 预换仓路径门禁一致性修复（横盘币绕门禁漏洞）
+
+### 问题（实盘日志发现）
+PIPPIN 4H ADX=13 横盘，全部 FVG 信号被 `[ExtremeMove]` 门禁拒绝（signals=[]），
+但 CoinTracker 研究分 final_score=+1.00 仍混入**预换仓候选**：
+- `get_fresh_signals` 只检查 analysis 置信度，不检查 signals 是否为空
+- 预换仓路径按 final_score 选候选 → 横盘币的研究分虚高仍参与换仓比较
+- 当前被评分门槛（+0.70）兜住未换仓，但 signals 非空+研究分高时即可绕门禁换仓入场
+
+### 修复
+- 新增 `_pick_switch_candidate`：候选选择跳过无有效 FVG 信号的缓存条目，
+  与主扫描路径（`all_signals.extend(entry.signals)`）口径一致，杜绝横盘币绕门禁入场
+- 主循环预换仓路径（3083 行）改用该函数
+
+### 验证
+- 新增回归 `test_switch_candidate_skips_gate_rejected`：研究分虚高但无信号条目
+  被排除，有真实信号候选被选中，全无信号不触发换仓，持仓币不参与候选
+- 回归 9/9 + `tests/` 48/48 全过
+
 ## [2026-08-08] FVG Hunter 硬门禁（只吃确定性极端行情）
 
 ### 策略 Alpha 升级（源自 4 小时横盘监控复盘）
