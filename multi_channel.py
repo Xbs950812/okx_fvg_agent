@@ -25,6 +25,7 @@
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,6 +38,21 @@ from strategy import Candle, FVG, Signal, candles_from_raw, detect_fvg
 
 
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# 修复 Bug 37: FGI 缓存（避免批量扫描时重复请求 external API）
+# ===========================================================================
+_FGI_CACHE: Optional[int] = None
+_FGI_CACHE_TS: float = 0.0
+_FGI_CACHE_TTL: float = 3600.0  # 1 小时
+_FGI_CACHE_HARD_TTL: float = 7200.0  # 2小时硬上限，比软 TTL 长
+_FGI_CACHE_LOCK = threading.Lock()
+
+# 修复 M-17: BTC/ETH 指数蜡烛缓存（避免批量扫描时重复请求）
+_IDX_CANDLE_CACHE: Dict[str, Tuple[List, float]] = {}
+_IDX_CANDLE_CACHE_TTL: float = 60.0  # 60 秒
+_IDX_CACHE_LOCK = threading.Lock()
 
 
 # ===========================================================================
@@ -151,7 +167,7 @@ def analyze_price_action(
 
     # ---- 3. 波动率状态 ----
     if len(candles_1h) >= 30:
-        returns = [abs(math.log(candles_1h[i].close / candles_1h[i - 1].close))
+        returns = [math.log(candles_1h[i].close / candles_1h[i - 1].close)
                    for i in range(1, len(candles_1h))]
         current_vol = np.std(returns[-10:]) if len(returns) >= 10 else 0
         hist_vol = np.std(returns) if len(returns) >= 10 else 0
@@ -235,6 +251,19 @@ def analyze_market_structure(
             observations=["订单簿数据不可用"],
         )
 
+    # 修复 Bug 32: current_price 异常保护（API 返回 0 时跳过流动性墙检测，
+    # 避免 current_price * 0.98 = 0 导致所有买盘被误判为墙）
+    if current_price <= 0:
+        return ChannelReport(
+            channel_name="市场结构",
+            weight=0.25,
+            bullish_score=0.0,
+            bearish_score=0.0,
+            net_score=0.0,
+            confidence=0.0,
+            observations=["价格异常跳过结构分析"],
+        )
+
     # ---- 1. 买卖深度失衡 ----
     bids = order_book.get("bids", [])
     asks = order_book.get("asks", [])
@@ -274,7 +303,7 @@ def analyze_market_structure(
         px = float(b[0])
         sz = float(b[1])
         if px >= current_price * 0.98:
-            if sz > np.mean([float(x[1]) for x in bids[:5]]) * 2:
+            if len(bids) >= 2 and sz > np.mean([float(x[1]) for x in bids[:5]]) * 2:
                 bid_walls.append((px, sz))
 
     # 卖方流动性墙
@@ -283,7 +312,7 @@ def analyze_market_structure(
         px = float(a[0])
         sz = float(a[1])
         if px <= current_price * 1.02:
-            if sz > np.mean([float(x[1]) for x in asks[:5]]) * 2:
+            if len(asks) >= 2 and sz > np.mean([float(x[1]) for x in asks[:5]]) * 2:
                 ask_walls.append((px, sz))
 
     if bid_walls:
@@ -353,20 +382,27 @@ def analyze_capital_flow(
     funding_history = client.get_funding_rate_history(inst_id, limit=24)
 
     if funding_rate is not None:
-        if funding_rate > 0.005:  # 0.5% 以上极度看多
-            obs.append(f"资金费率极度偏多 ({funding_rate:.4%})，多头拥挤，警惕回调")
-            reds.append(f"资金费率 {funding_rate:.4%} 过高，多头拥挤风险")
-            bearish += 0.25
-        elif funding_rate > 0.001:  # 0.1% 以上偏多
-            obs.append(f"资金费率偏多 ({funding_rate:.4%})，市场情绪偏乐观")
-            bullish += 0.10
-        elif funding_rate < -0.005:
-            obs.append(f"资金费率极度偏空 ({funding_rate:.4%})，空头拥挤，可能反弹")
-            reds.append(f"资金费率 {funding_rate:.4%} 过低，空头拥挤风险")
-            bullish += 0.25
-        elif funding_rate < -0.001:
-            obs.append(f"资金费率偏空 ({funding_rate:.4%})，市场情绪偏悲观")
-            bearish += 0.10
+        # 资金费率方向：正=多头付空头（看涨情绪），负=空头付多头（看跌情绪）
+        # 极端值则反向解读：过度拥挤 = 反转风险
+        fr_sign = 1 if funding_rate > 0 else (-1 if funding_rate < 0 else 0)
+        fr_abs = abs(funding_rate)
+
+        if fr_abs > 0.005:  # 极度拥挤 → 反向信号
+            if fr_sign > 0:
+                obs.append(f"资金费率极度偏多 ({funding_rate:.4%})，多头拥挤，警惕回调")
+                reds.append(f"资金费率 {funding_rate:.4%} 过高，多头拥挤风险")
+                bearish += 0.25
+            else:
+                obs.append(f"资金费率极度偏空 ({funding_rate:.4%})，空头拥挤，可能反弹")
+                reds.append(f"资金费率 {funding_rate:.4%} 过低，空头拥挤风险")
+                bullish += 0.25
+        elif fr_abs > 0.001:  # 温和偏离 → 跟随方向
+            if fr_sign > 0:
+                obs.append(f"资金费率偏多 ({funding_rate:.4%})，市场情绪偏乐观")
+                bullish += 0.10
+            else:
+                obs.append(f"资金费率偏空 ({funding_rate:.4%})，市场情绪偏悲观")
+                bearish += 0.10
         else:
             obs.append(f"资金费率中性 ({funding_rate:.4%})，多空平衡")
 
@@ -480,7 +516,9 @@ def analyze_market_sentiment(
         elif fgi >= 60:
             obs.append(f"恐慌贪婪指数: {fgi} (贪婪)")
         elif fgi <= 25:
+            # 修复 Bug 33: 极度恐慌区域也应加红旗（流动性枯竭/踩踏风险）
             obs.append(f"恐慌贪婪指数: {fgi} (极度恐慌)，市场恐慌往往是机会")
+            reds.append("极度恐慌区域，可能存在流动性踩踏风险")
             bullish += 0.15
         elif fgi <= 40:
             obs.append(f"恐慌贪婪指数: {fgi} (恐慌)")
@@ -512,7 +550,17 @@ def analyze_market_sentiment(
 
 
 def _fetch_fear_greed_index() -> Optional[int]:
-    """获取加密货币恐慌贪婪指数 (0-100)。"""
+    """获取加密货币恐慌贪婪指数 (0-100)。
+
+    修复 Bug 37: 增加 TTL 缓存（10 分钟），避免批量扫描 100 个币种时
+    对 alternative.me API 请求 100 次导致速率限制。
+    """
+    global _FGI_CACHE, _FGI_CACHE_TS
+    now = time.time()
+    with _FGI_CACHE_LOCK:
+        if _FGI_CACHE is not None and (now - _FGI_CACHE_TS) < _FGI_CACHE_TTL:
+            return _FGI_CACHE
+
     import requests as req
     try:
         resp = req.get(
@@ -522,9 +570,17 @@ def _fetch_fear_greed_index() -> Optional[int]:
         )
         if resp.status_code == 200:
             data = resp.json()
-            return int(data["data"][0]["value"])
+            val = int(data["data"][0]["value"])
+            with _FGI_CACHE_LOCK:
+                _FGI_CACHE = val
+                _FGI_CACHE_TS = now
+            return val
     except Exception:
         pass
+    # 失败时若有过期缓存且未超过硬上限仍返回，避免单次失败影响所有币种分析
+    with _FGI_CACHE_LOCK:
+        if _FGI_CACHE is not None and (now - _FGI_CACHE_TS) < _FGI_CACHE_HARD_TTL:
+            return _FGI_CACHE
     return None
 
 
@@ -550,8 +606,22 @@ def analyze_macro_context(
 
     # ---- 1. BTC 主导地位 ----
     # 用 BTC 指数价格变化近似判断
-    btc_candles = client.get_index_candles("BTC-USDT", bar="1D", limit=7)
-    eth_candles = client.get_index_candles("ETH-USDT", bar="1D", limit=7)
+    # 修复 M-17: 使用模块级缓存，避免批量扫描时重复请求 BTC/ETH 指数蜡烛
+    def _get_cached_index_candles(inst: str, bar: str, limit: int):
+        now = time.time()
+        cache_key = f"{inst}:{bar}:{limit}"
+        with _IDX_CACHE_LOCK:
+            if cache_key in _IDX_CANDLE_CACHE:
+                cached_data, cached_ts = _IDX_CANDLE_CACHE[cache_key]
+                if now - cached_ts < _IDX_CANDLE_CACHE_TTL:
+                    return cached_data
+        data = client.get_index_candles(inst, bar=bar, limit=limit)
+        with _IDX_CACHE_LOCK:
+            _IDX_CANDLE_CACHE[cache_key] = (data, now)
+        return data
+
+    btc_candles = _get_cached_index_candles("BTC-USDT", "1D", 7)
+    eth_candles = _get_cached_index_candles("ETH-USDT", "1D", 7)
 
     if btc_candles and eth_candles and len(btc_candles) >= 3 and len(eth_candles) >= 3:
         btc_ret = (float(btc_candles[0][4]) / float(btc_candles[-1][4]) - 1) * 100
@@ -638,22 +708,43 @@ class MasterTraderEngine:
             MasterAnalysis 综合研判结果
         """
         # ---- 1. 加权融合 ----
-        weighted_score = 0.0
-        total_confidence = 0.0
-        total_weight = 0.0
+        # 修复: 置信度膨胀 — 原公式 Σ(w×conf)/Σw 把 net_score=0（无观点）的通道
+        # 也计入置信度分子，导致"数据可得性"被当成"信号质量"。实测决策日志中
+        # 资金流向/市场情绪/宏观背景三通道长期 net=0，最终置信度仍被灌到 0.6+，
+        # 而真正有方向观点的只有 1~2 个通道。
+        # 新公式:
+        #   - 仅统计有观点的通道 (|net_score| > 0.05 且 confidence > 0.2)
+        #   - final_confidence = 活跃通道加权置信度 × 活跃权重占比
+        #     (活跃通道越少置信度越低, 数据稀疏自然降级)
+        _active_channels = [
+            ch for ch in channels
+            if ch.confidence > 0.2 and abs(ch.net_score) > 0.05
+        ]
+        _active_weight = sum(
+            self.weights.get(ch.channel_name, ch.weight) for ch in _active_channels
+        )
+        total_weight = sum(
+            self.weights.get(ch.channel_name, ch.weight) for ch in channels
+        )
 
-        for ch in channels:
-            w = self.weights.get(ch.channel_name, ch.weight)
-            weighted_score += ch.net_score * w * ch.confidence
-            total_confidence += w * ch.confidence
-            total_weight += w
-
-        if total_confidence > 0:
-            final_score = weighted_score / total_confidence
-        else:
+        if _active_weight <= 0:
             final_score = 0.0
+            final_confidence = 0.0
+        else:
+            weighted_score = 0.0
+            total_confidence = 0.0
+            for ch in _active_channels:
+                w = self.weights.get(ch.channel_name, ch.weight)
+                weighted_score += ch.net_score * w * ch.confidence
+                total_confidence += w * ch.confidence
+            final_score = weighted_score / total_confidence
+            final_confidence = (
+                (total_confidence / _active_weight)
+                * (_active_weight / total_weight)
+                if total_weight > 0 else 0.0
+            )
 
-        final_confidence = total_confidence / total_weight if total_weight > 0 else 0.0
+        final_confidence = max(0.0, min(1.0, final_confidence))
 
         # ---- 2. 方向判断 ----
         if final_score > 0.15:
@@ -664,15 +755,27 @@ class MasterTraderEngine:
             direction = "neutral"
 
         # ---- 3. 通道一致性检查 ----
-        net_scores = [ch.net_score for ch in channels if ch.confidence > 0.2]
-        if len(net_scores) >= 3:
+        # 修复: 原实现 active<3 时 agreement 硬编码 0.5 (门禁永远通过)。
+        # 修正: <2 个有观点通道时 agreement 取中性 0.5 — 不背书"多通道共识"
+        # (置信度已按活跃权重打折承担筛选职责), 但也不能置 0 否则单通道信号
+        # 在所有挡位下都永不交易, 与激进挡位"每天必建仓"设计意图冲突
+        # (实测 5 轮 0 建仓, 缓存池 36→4)。
+        net_scores = [
+            ch.net_score for ch in channels
+            if ch.confidence > 0.2 and abs(ch.net_score) > 0.05
+        ]
+        if len(net_scores) >= 2:
             positive = sum(1 for s in net_scores if s > 0.05)
             negative = sum(1 for s in net_scores if s < -0.05)
             agreement = max(positive, negative) / len(net_scores)
+            # 检查信号强度：通道方向一致但信号太弱时降低一致性评分
+            avg_magnitude = np.mean([abs(s) for s in net_scores])
+            if avg_magnitude < 0.15:
+                agreement *= 0.7  # 信号强度不足，一致性评分降低 30%
         else:
-            agreement = 0.5
+            agreement = 0.5  # 数据不足 → 中性(0.5)，由置信度承担筛选职责
 
-        contradiction = (agreement < 0.6) and (len(net_scores) >= 3)
+        contradiction = (agreement < 0.6) and (len(net_scores) >= 2)
 
         # ---- 4. 收集红旗 ----
         all_reds = []

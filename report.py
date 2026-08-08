@@ -11,13 +11,15 @@
 import logging
 import os
 import smtplib
+import threading
 import time
+import locale
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +43,9 @@ class SessionReporter:
         self.email_cfg = report_cfg.get("email", {})
 
         # 追踪已触发的时段（防止重复触发）
+        self._lock = threading.Lock()
         self._triggered_minutes: set = set()
-        self._last_report_date = ""
+        self._last_report_timestamp = 0.0
 
     def should_generate_report(self) -> bool:
         """检查是否到了时段转换点且尚未触发。"""
@@ -51,25 +54,25 @@ class SessionReporter:
 
         now = datetime.now(BEIJING_TZ)
         current_time = now.strftime("%H:%M")
-        current_date = now.strftime("%Y-%m-%d")
+        current_ts = datetime.now(timezone.utc).timestamp()
 
-        # 每天重置
-        if current_date != self._last_report_date:
-            self._triggered_minutes.clear()
-            self._last_report_date = current_date
+        with self._lock:
+            # 每天重置（基于 UTC 时间戳判断是否跨天）
+            if current_ts - self._last_report_timestamp > 86400:
+                self._triggered_minutes.clear()
+                self._last_report_timestamp = current_ts
 
-        # 检查是否匹配任一时段
-        for session_time in self.session_times:
-            if current_time == session_time and session_time not in self._triggered_minutes:
-                self._triggered_minutes.add(session_time)
-                return True
+            # 检查是否匹配任一时段
+            for session_time in self.session_times:
+                if current_time == session_time and session_time not in self._triggered_minutes:
+                    self._triggered_minutes.add(session_time)
+                    return True
 
         return False
 
     def get_session_label(self) -> str:
         """获取当前时段标签。"""
         now = datetime.now(BEIJING_TZ)
-        hour = now.hour
 
         session_names = {
             "08:00": "亚洲开盘",
@@ -114,7 +117,7 @@ def generate_html_report(
     total = len(cache_entries)
     with_signals = sum(1 for e in cache_entries if e.has_signals)
     with_analysis = sum(1 for e in cache_entries if e.has_analysis)
-    regime_counts = {"BULLISH": 0, "BEARISH": 0, "NEUTRAL": 0, "VOLATILE": 0}
+    regime_counts = {"FUSED": 0, "DIVERGENT": 0, "NEUTRAL": 0, "TRANSITIONING": 0}
     for e in cache_entries:
         regime = e.detected_regime or "NEUTRAL"
         if regime in regime_counts:
@@ -147,10 +150,10 @@ def generate_html_report(
   .score-positive {{ color: #3fb950; }}
   .score-negative {{ color: #f85149; }}
   .regime {{ font-size: 11px; padding: 2px 6px; border-radius: 4px; }}
-  .regime-BULLISH {{ background: #1b3d1b; color: #3fb950; }}
-  .regime-BEARISH {{ background: #3d1b1b; color: #f85149; }}
+  .regime-FUSED {{ background: #1b3d1b; color: #3fb950; }}
+  .regime-DIVERGENT {{ background: #3d1b1b; color: #f85149; }}
   .regime-NEUTRAL {{ background: #1b2b3d; color: #58a6ff; }}
-  .regime-VOLATILE {{ background: #3d3d1b; color: #d2991d; }}
+  .regime-TRANSITIONING {{ background: #3d3d1b; color: #d2991d; }}
   .footer {{ margin-top: 30px; padding: 15px 0; border-top: 1px solid #30363d; color: #8b949e; font-size: 12px; }}
   .risk-high {{ color: #f85149; }}
   .risk-warn {{ color: #d2991d; }}
@@ -178,16 +181,20 @@ def generate_html_report(
     <div class="label">多通道分析</div>
   </div>
   <div class="card green">
-    <div class="value">{regime_counts.get('BULLISH', 0)}</div>
-    <div class="label">多头体制</div>
+    <div class="value">{regime_counts.get('FUSED', 0)}</div>
+    <div class="label">融合体制</div>
   </div>
   <div class="card red">
-    <div class="value">{regime_counts.get('BEARISH', 0)}</div>
-    <div class="label">空头体制</div>
+    <div class="value">{regime_counts.get('DIVERGENT', 0)}</div>
+    <div class="label">背离体制</div>
   </div>
   <div class="card">
     <div class="value">{regime_counts.get('NEUTRAL', 0)}</div>
     <div class="label">中性</div>
+  </div>
+  <div class="card">
+    <div class="value">{regime_counts.get('TRANSITIONING', 0)}</div>
+    <div class="label">过渡中</div>
   </div>
 </div>
 
@@ -217,16 +224,17 @@ def generate_html_report(
             continue
 
         score_class = "score-positive" if a.final_score >= 0 else "score-negative"
-        direction = "做多" if a.final_score > 0 else "做空"
-        dir_class = "direction-long" if a.final_score > 0 else "direction-short"
+        direction = "做多" if a.final_score > 0.05 else ("做空" if a.final_score < -0.05 else "中性")
+        dir_class = "direction-long" if a.final_score > 0.05 else ("direction-short" if a.final_score < -0.05 else "")
         regime = entry.detected_regime or "NEUTRAL"
-        funding = f"{entry.funding_rate*100:+.4f}%" if entry.funding_rate else "N/A"
-        spread = f"{entry.spread_pct:.3f}%" if entry.spread_pct else "N/A"
+        funding = f"{entry.funding_rate*100:+.4f}%" if entry.funding_rate is not None else "N/A"
+        # 修复 R-1: spread_pct=0.0 是合法状态（零价差），不应显示为 N/A
+        spread = f"{entry.spread_pct:.3f}%" if entry.spread_pct is not None else "N/A"
 
         risk_class = ""
-        if entry.funding_rate and abs(entry.funding_rate) > 0.005:
+        if entry.funding_rate is not None and abs(entry.funding_rate) > 0.005:
             risk_class = "risk-warn"
-        if entry.funding_rate and abs(entry.funding_rate) > 0.01:
+        if entry.funding_rate is not None and abs(entry.funding_rate) > 0.01:
             risk_class = "risk-high"
 
         html += f"""<tr>
@@ -235,10 +243,10 @@ def generate_html_report(
   <td>{entry.current_price:.4f}</td>
   <td><span class="direction {dir_class}">{direction}</span></td>
   <td class="{score_class}">{a.final_score:+.2f}</td>
-  <td>{a.final_confidence:.0%}</td>
-  <td>{a.channel_agreement:.0%}</td>
+  <td>{(a.final_confidence or 0):.0%}</td>
+  <td>{(a.channel_agreement or 0):.0%}</td>
   <td><span class="regime regime-{regime}">{regime}</span></td>
-  <td>{len(entry.signals)}</td>
+  <td>{len(entry.signals) if entry.signals else 0}</td>
   <td class="{risk_class}">{funding}</td>
   <td>{spread}</td>
 </tr>
@@ -256,7 +264,7 @@ def generate_html_report(
         a = entry.analysis
         if a is None:
             continue
-        direction = "做多" if a.final_score > 0 else "做空"
+        direction = "做多" if a.final_score > 0.05 else ("做空" if a.final_score < -0.05 else "中性")
 
         html += f"""
 <h3>#{i+1} {entry.inst_id} — {direction} | 置信度 {a.final_confidence:.0%} | 评分 {a.final_score:+.2f}</h3>
@@ -279,7 +287,7 @@ def generate_html_report(
 
     html += f"""
 <div class="footer">
-  <p>OKX FVG Trading Agent v3.0 | 报告自动生成于 {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</p>
+  <p>OKX FVG Trading Agent v3.2 | 报告自动生成于 {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</p>
   <p>本报告仅供参考，不构成投资建议。加密货币交易风险极高，请谨慎决策。</p>
 </div>
 </div>
@@ -356,7 +364,18 @@ def send_email_report(
         msg["From"] = sender
         msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
-        msg["Date"] = now.strftime("%a, %d %b %Y %H:%M:%S +0800")
+        # L-20: 强制英文 locale 防止 RFC 2822 日期头出现中文
+        try:
+            old_locale = locale.setlocale(locale.LC_TIME, 'C')
+        except locale.Error:
+            old_locale = None
+        date_header = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S +0000')
+        if old_locale is not None:
+            try:
+                locale.setlocale(locale.LC_TIME, old_locale)
+            except locale.Error:
+                pass
+        msg["Date"] = date_header
 
         # HTML 正文
         msg.attach(MIMEText(html_content, "html", "utf-8"))
@@ -373,31 +392,47 @@ def send_email_report(
                 )
                 msg.attach(part)
 
-        # 发送
+        # 发送（带重试：最多 3 次，指数退避 2s/4s/8s）
         smtp_host = email_cfg.get("smtp_host", "smtp.qq.com")
         smtp_port = email_cfg.get("smtp_port", 465)
+        max_retries = 3
+        last_error = None
 
-        if email_cfg.get("smtp_ssl", True):
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
-        else:
-            server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
-            server.starttls()
+        for attempt in range(1, max_retries + 1):
+            server = None
+            try:
+                if email_cfg.get("smtp_ssl", True):
+                    server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
+                else:
+                    server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+                    server.starttls()
 
-        server.login(sender, password)
-        server.sendmail(sender, recipients, msg.as_string())
-        server.quit()
+                server.login(sender, password)
+                server.sendmail(sender, recipients, msg.as_string())
 
-        logger.info(f"邮件发送成功 → {', '.join(recipients)}")
-        return True
+                logger.info(f"邮件发送成功 → {', '.join(recipients)}")
+                return True
+            except (smtplib.SMTPConnectError, smtplib.SMTPException,
+                    ConnectionError, TimeoutError, OSError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    logger.warning(
+                        "SMTP 发送失败 (第 %d/%d 次): %s，%ds 后重试...",
+                        attempt, max_retries, e, delay,
+                    )
+                    time.sleep(delay)
+            finally:
+                if server is not None:
+                    try:
+                        server.quit()
+                    except Exception:
+                        pass
 
-    except smtplib.SMTPAuthenticationError:
-        logger.error("邮件发送失败: SMTP 认证失败，请检查邮箱和授权码")
-        return False
-    except smtplib.SMTPConnectError:
-        logger.error(f"邮件发送失败: 无法连接 SMTP 服务器 {smtp_host}:{smtp_port}")
+        logger.error(f"邮件发送失败: 重试 {max_retries} 次后仍失败，最后错误: {last_error}")
         return False
     except Exception as e:
-        logger.error(f"邮件发送失败: {e}")
+        logger.error(f"邮件构建/发送异常: {e}")
         return False
 
 
@@ -405,20 +440,25 @@ def send_email_report(
 # 一站式入口
 # ---------------------------------------------------------------------------
 
-def generate_and_send_report(cache, config: dict) -> bool:
+def generate_and_send_report(
+    cache, config: dict, reporter: Optional[SessionReporter] = None
+) -> bool:
     """生成报告、保存到本地、发送邮件（一站式）。
 
     Args:
         cache: CoinResearchCache 实例
         config: 完整配置
+        reporter: 可选，外部 SessionReporter 实例（复用防重复触发状态）
 
     Returns:
         是否成功
     """
-    reporter = SessionReporter(config)
-
-    if not reporter.should_generate_report():
-        return False
+    # 修复: 优先使用外部传入的 reporter（复用 _triggered_minutes 防重复），
+    # 仅在未传入时新建（兼容独立调用场景，如测试/手动触发）
+    if reporter is None:
+        reporter = SessionReporter(config)
+        if not reporter.should_generate_report():
+            return False
 
     session_label = reporter.get_session_label()
     logger.info(f"⏰ 触发 {session_label} 研究报告生成...")

@@ -42,7 +42,7 @@ from typing import Optional, List, Dict, Tuple, Any
 import numpy as np
 import pandas as pd
 
-from okx_client import OKXClient
+from okx_client import OKXClient, OKXQueryError
 from ws_ticker_cache import WsTickerCache
 from strategy import (
     Candle, Signal,
@@ -1045,12 +1045,17 @@ def risk_gate(
         _notional = 0.0
         try:
             _poss = client.get_positions()
+            # 修复 P0-B (fail-closed): 持仓查询失败(None)时敞口未知，
+            # 必须拦截开仓而不是当"零敞口"放行
+            if _poss is None:
+                return False, "Exposure check unavailable (get_positions failed)"
             _notional = sum(
                 abs(float(p.get("pos", "0")) * float(p.get("markPx", "0")))
                 for p in _poss
             )
-        except (ConnectionError, TimeoutError, OSError, ValueError) as _ee:
-            logger.warning(f"get_positions 失败，跳过敞口检查: {_ee}")
+        except (ConnectionError, TimeoutError, OSError, ValueError, OKXQueryError) as _ee:
+            logger.warning(f"get_positions 失败，拒绝开仓(fail-closed): {_ee}")
+            return False, "Exposure check failed (fail-closed)"
         except Exception:
             _notional = 0.0
         _exp_limit = equity * _max_exp / 100.0
@@ -1060,14 +1065,75 @@ def risk_gate(
 
     # 挂单数检查（避免挂单堆积）
     try:
-        pending = client.get_pending_orders()
-    except (ConnectionError, TimeoutError, OSError, ValueError) as _pe:
+        pending = client.get_pending_orders() or []
+    except (ConnectionError, TimeoutError, OSError, ValueError, OKXQueryError) as _pe:
         logger.warning(f"get_pending_orders 失败，跳过挂单数检查: {_pe}")
         pending = []
     if len(pending) >= risk_cfg["max_positions"] * 2:
         return False, f"Too many pending orders ({len(pending)})"
 
     return True, "OK"
+
+
+def _risk_breaker_triggered(state_manager, config,
+                            adaptive_tuner=None) -> Tuple[bool, str]:
+    """修复 P1-5: daily_loss / 自适应暂停的统一断路器查询。
+
+    换仓预检(step 1.6)与平仓后开新仓(step 1.5)都在 risk_gate(step 4)之前执行，
+    此前可绕过日亏限额与自适应暂停（亏损日继续平旧开新）。任何开仓路径
+    （换仓/反手/平仓后重开）必须先查此门，命中则一律禁止。
+    """
+    _risk = config.get("risk", {}) or {}
+    _ds = state_manager.state.daily_start_equity
+    try:
+        _mll = _ds * float(_risk.get("max_daily_loss_pct", 10.0) or 0) / 100.0
+    except (TypeError, ValueError):
+        _mll = 0.0
+    if _mll > 0 and state_manager.state.daily_loss <= -_mll:
+        return True, (f"daily_loss 已达上限 ({state_manager.state.daily_loss:.2f} USDT)，"
+                      f"禁止换仓/反手/新开仓")
+    if adaptive_tuner is not None:
+        try:
+            _pu = float(getattr(adaptive_tuner, "pause_until", 0) or 0)
+            if _pu > time.time():
+                return True, (
+                    f"自适应暂停中(连亏/回撤断路器, 至 "
+                    f"{datetime.fromtimestamp(_pu, timezone.utc).strftime('%H:%M')} UTC)"
+                )
+            if getattr(adaptive_tuner, "trading_paused", False):
+                return True, "自适应调参器 trading_paused"
+        except Exception:
+            pass
+    return False, ""
+
+
+def _exposure_cap_allows_add(client, equity, config) -> bool:
+    """修复 P1-6: 聚合名义敞口是否允许再加一笔（保留 30% 余量给新单）。
+
+    金字塔加仓此前只查"币种仍在持仓"，无聚合敞口上限 —— 多轮 0.5× 加仓
+    可把单币名义敞口推到数倍于 max_exposure_pct，且每笔各挂独立止损单，
+    触发时只能部分平仓。持仓查询失败时拒绝加仓（fail-closed）。
+    """
+    _risk = config.get("risk", {}) or {}
+    try:
+        _max_exp = float(_risk.get("max_exposure_pct", 30.0) or 0)
+    except (TypeError, ValueError):
+        _max_exp = 0.0
+    if _max_exp <= 0:
+        return True
+    try:
+        _poss = client.get_positions()
+        if _poss is None:
+            return False  # fail-closed: 查询失败不得加仓
+    except Exception:
+        return False
+    _notional = sum(
+        abs(float(p.get("pos", "0")) * float(p.get("markPx", "0")))
+        for p in _poss
+    )
+    _limit = equity * _max_exp / 100.0
+    # 当前敞口 ≥ 70% 上限时不再加仓（为新单预留 ≥30% 空间，加仓后不超限）
+    return _notional <= _limit * 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -1739,6 +1805,19 @@ def _execute_signal_with_quant_enhancements(
         return None
 
     exec_config = copy.deepcopy(config)
+    # 修复 P2-1: 接线 market_guard 的 WARNING 减仓因子（此前从未被调用，
+    # WARNING 状态——资金费极端/OI 异常——不产生任何仓位缩放）。
+    # CRISIS 由 can_open_new_position 硬拦截，WARNING 走减半仓。
+    if market_guard is not None and market_state is not None:
+        try:
+            _mg_factor = market_guard.reduce_position_factor(market_state)
+            if _mg_factor < 1.0 and "risk" in exec_config:
+                exec_config["risk"]["risk_per_trade_pct"] *= _mg_factor
+                logger.info(
+                    f"[MarketGuard] 状态 {market_state.regime}，仓位系数 {_mg_factor:.0%}"
+                )
+        except Exception:
+            pass
     inputs: Optional[Dict[str, Any]] = None
 
     # ---- 2. AI 风险委员会评估 ----
@@ -1786,8 +1865,13 @@ def _execute_signal_with_quant_enhancements(
                 logger.info(_weak_reason)
                 return None
         except Exception as _we:
-            # 审核异常时放行（不阻塞主循环，与 ML/汇流一致的降级策略）
-            logger.warning(f"[WeakGate] {signal.inst_id} 审核异常，放行: {_we}")
+            # 修复 P2-3: 弱信号共振审核异常时 fail-closed（拒绝开仓）。
+            # 这是风险过滤门——组件故障时放行 = 少一道闸，宁可错过不可冒险。
+            # （与 ML/汇流评分类门的放行策略区分：评分类可降级，风控类必须拦截）
+            logger.warning(
+                f"[WeakGate] {signal.inst_id} 审核异常，拒绝开仓(fail-closed): {_we}"
+            )
+            return None
 
     # ---- 3. 执行下单 ----
     ord_id = execute_signal(client, signal, equity, exec_config, instrument_info)
@@ -2724,7 +2808,7 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
         # 否则 active_count 误判为 0 会使 risk_gate 放行，已满仓时超限开仓
         try:
             positions = _refresh_positions()
-        except (ConnectionError, TimeoutError, OSError, ValueError) as _pe:
+        except (ConnectionError, TimeoutError, OSError, ValueError, OKXQueryError) as _pe:
             logger.error(f"get_positions 失败: {_pe}，跳过本轮")
             state_manager.save()
             if tracker:
@@ -2760,7 +2844,7 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 try:
                     _oi = client.get_order(inst_id=_pc_inst, ord_id=_pc_ord)
                     _close_ord_filled = bool(_oi) and _oi.get("state") == "filled"
-                except (ConnectionError, TimeoutError, OSError, ValueError):
+                except (ConnectionError, TimeoutError, OSError, ValueError, OKXQueryError):
                     _close_ord_filled = False
             if not _still_open and _close_ord_filled:
                 # 平仓已确认，从交易所获取精确 PnL
@@ -2855,6 +2939,10 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
 
                 # 清理 pending_close 和 trailing stop
                 state_manager.state._pending_close = None
+                # 修复 P2-6: 平仓确认后同步清理 active_signals 条目 —
+                # 纸面模式不走 monitor_positions 对账，此前已平仓条目永久残留，
+                # 重启后同币种再开仓会 setdefault 合并旧字段
+                state_manager.state.active_signals.pop(_pc_inst, None)
                 if _pc_inst in (trailing_stops or {}):
                     del trailing_stops[_pc_inst]
                 trailing_algo_ids.pop(_pc_inst, None)
@@ -2863,9 +2951,30 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 _lot_sz_cache.pop(_pc_inst, None)
                 state_manager.state.trailing_stop_state.pop(_pc_inst, None)
 
+                # 修复 P1-2: 平仓确认后联动撤销该币残留的 oco/conditional 保护单。
+                # OKX 的 algo 单不会随持仓平仓自动撤销，残留会成为孤儿单，
+                # 同币再开仓时被 trailing 自愈误登记 → 新仓裸奔或错误价位触发。
+                try:
+                    for _ot in ("oco", "conditional"):
+                        for _a in (client.get_algo_orders(
+                                inst_id=_pc_inst, inst_type="SWAP",
+                                ord_type=_ot) or []):
+                            if _a.get("state") in ("live", "effective"):
+                                client.cancel_algo_order(
+                                    _a.get("algoId", ""), _pc_inst)
+                except Exception as _ce:
+                    logger.warning(
+                        f"[Close] {_pc_inst} 清理残留保护单失败: {_ce}")
+
                 # 刷新 positions 和 active_count
-                positions = _refresh_positions()
-                active_count = len([p for p in positions.values() if p["size"] > 0])
+                # 修复 P0-D: 受保护刷新，避免网络异常直抛导致记账断裂/崩溃重启
+                try:
+                    positions = _refresh_positions()
+                    active_count = len(
+                        [p for p in positions.values() if p["size"] > 0])
+                except (ConnectionError, TimeoutError, OSError,
+                        ValueError, OKXQueryError) as _rf2_e:
+                    logger.warning(f"[Close] 刷新持仓失败(不影响记账): {_rf2_e}")
 
                 # 平仓确认后，直接执行开新仓（使用 pending_close 中保存的信号）
                 _best_signal = _pc.get("best_signal")
@@ -2873,6 +2982,27 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 if _best_signal and _best_coin:
                     logger.info(f"开新仓: {_best_signal.inst_id} "
                                 f"(score={_best_signal.score:.2f})")
+                    # 修复 P1-5: 平仓后开新仓路径在 risk_gate 之前，
+                    # 必须先查统一断路器（日亏限额/自适应暂停），否则
+                    # 亏损日/暂停期会通过"先平后开"绕过风控继续交易
+                    _br_ok, _br_reason = _risk_breaker_triggered(
+                        state_manager, config, adaptive_tuner)
+                    if _br_ok:
+                        logger.warning(
+                            f"[Breaker] 平仓已确认但禁止开新仓: {_br_reason}"
+                        )
+                        state_manager.save()
+                        try:
+                            positions = _refresh_positions()
+                            active_count = len(
+                                [p for p in positions.values() if p["size"] > 0])
+                        except (ConnectionError, TimeoutError, OSError,
+                                ValueError, OKXQueryError) as _br_e:
+                            logger.debug(f"[Breaker] 刷新持仓失败(不影响退出): {_br_e}")
+                        if tracker:
+                            tracker.resume()
+                        time.sleep(scan_interval)
+                        continue
                     # 修复: 已在持仓中的币种不重复开仓，避免 _info 未定义导致崩溃
                     if _best_signal.inst_id not in positions:
                         _info = client.get_instrument_info(_best_signal.inst_id)
@@ -2907,11 +3037,18 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                                 logger.info(f"Opened new position: {new_ord_id}")
                             else:
                                 logger.error("Failed to open new position after closing old one")
-                        except (ConnectionError, TimeoutError, OSError, ValueError, TypeError) as e:
+                        except (ConnectionError, TimeoutError, OSError, ValueError, TypeError, OKXQueryError) as e:
                             logger.error(f"Failed to open new position after close: {e}")
                         # 刷新 positions
-                        positions = _refresh_positions()
-                        active_count = len([p for p in positions.values() if p["size"] > 0])
+                        # 修复 P0-D: 此处刷新无 try 包裹曾导致网络异常直抛 → 崩溃重启，
+                        # 平仓确认记账断裂。改为受保护刷新，失败不影响已完成的记账。
+                        try:
+                            positions = _refresh_positions()
+                            active_count = len(
+                                [p for p in positions.values() if p["size"] > 0])
+                        except (ConnectionError, TimeoutError, OSError,
+                                ValueError, OKXQueryError) as _rf_e:
+                            logger.warning(f"[Close] 刷新持仓失败: {_rf_e}")
                         state_manager.save()
             elif _pc_age > 30:
                 # 超时 30 秒仍未平仓，记录错误并清理
@@ -2936,7 +3073,14 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
         # CRISIS/UNKNOWN 模式下不得再触发换仓（否则会覆盖单槽位 pending_close，
         # 丢失原平仓 ord_id，或在熔断模式下无谓平仓）。
         _switch_triggered = False
-        if active_count >= risk_cfg["max_positions"] and cache and not _skip_new_position:
+        # 修复 P1-5: 换仓路径在 risk_gate(step 4)之前执行，必须先查统一断路器
+        # （日亏限额/自适应暂停）。否则亏损日/暂停期可通过"先平后开"绕过风控，
+        # 在日亏已触顶时继续换仓开新仓。
+        _br_ok, _br_reason = _risk_breaker_triggered(
+            state_manager, config, adaptive_tuner)
+        if _br_ok:
+            logger.info(f"[Breaker] 本轮禁止换仓: {_br_reason}")
+        if active_count >= risk_cfg["max_positions"] and cache and not _skip_new_position and not _br_ok:
             _cached_signals = cache.get_fresh_signals(
                 min_confidence=_active_thresholds["min_confidence"],
                 min_agreement=_active_thresholds["min_agreement"],
@@ -3483,6 +3627,9 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                     if (inst_id not in trailing_algo_ids
                             and inst_id not in _last_submitted_sl):
                         _existing_prot = None
+                        _pos_side = pos.get("pos_side", "")
+                        _pos_ctime_ms = int(
+                            float(pos.get("c_time", 0) or 0) * 1000)
                         for _ot in ("oco", "conditional"):
                             try:
                                 _prot_list = client.get_algo_orders(
@@ -3491,9 +3638,39 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                             except Exception:
                                 _prot_list = []
                             for _a in _prot_list:
-                                if _a.get("state") in ("live", "effective"):
-                                    _existing_prot = _a
-                                    break
+                                if _a.get("state") not in ("live", "effective"):
+                                    continue
+                                # 修复 P0-E: 过期孤儿保护单（前次开仓残留）不得
+                                # 登记为新仓保护 —— 否则新仓裸奔或按旧价位错误触发。
+                                # 校验: ① 方向必须与持仓一致 ② 挂单时间须晚于本仓开仓时间
+                                _a_side = _a.get("posSide", "")
+                                if _a_side not in ("", _pos_side):
+                                    logger.warning(
+                                        f"[TS] {inst_id} 保护单 posSide={_a_side} "
+                                        f"≠ 持仓 {_pos_side}，判定为异向孤儿单，撤销"
+                                    )
+                                    try:
+                                        client.cancel_algo_order(
+                                            _a.get("algoId", ""), inst_id)
+                                    except Exception:
+                                        pass
+                                    continue
+                                _a_ctime = int(_a.get("cTime", "0") or 0)
+                                if (_a_ctime > 0 and _pos_ctime_ms > 0
+                                        and _a_ctime < _pos_ctime_ms):
+                                    logger.warning(
+                                        f"[TS] {inst_id} 保护单 cTime={_a_ctime} "
+                                        f"< 持仓 cTime={_pos_ctime_ms}，判定为过期"
+                                        f"孤儿单，撤销后重挂"
+                                    )
+                                    try:
+                                        client.cancel_algo_order(
+                                            _a.get("algoId", ""), inst_id)
+                                    except Exception:
+                                        pass
+                                    continue
+                                _existing_prot = _a
+                                break
                             if _existing_prot:
                                 break
                         if _existing_prot:
@@ -4323,34 +4500,58 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 if _pyramiding_signal.inst_id not in positions:
                     _pyramiding_signal = None  # 持仓已变化，放弃加仓
                 else:
-                    _info = client.get_instrument_info(_pyramiding_signal.inst_id)
-                    # 减半风险比例用于加仓
-                    _pyramid_config = copy.deepcopy(config)
-                    _pyramid_config["risk"]["risk_per_trade_pct"] = \
-                        _pyramid_config["risk"].get("risk_per_trade_pct", 1.0) * 0.5
-                    _pyramid_ord = _execute_signal_with_quant_enhancements(
-                        client=client,
-                        signal=_pyramiding_signal,
-                        equity=equity,
-                        config=_pyramid_config,
-                        instrument_info=_info,
-                        state_manager=state_manager,
-                        risk_committee=risk_committee,
-                        market_guard=market_guard,
-                        market_state=market_state,
-                        signal_tracker=signal_tracker,
-                        analysis=best_analysis,
-                        debate_result=best_debate_result,
-                        candles_1h=best_candles_1h,
-                        funding_rate=best_funding_rate,
-                        regime=best_regime,
-                        paper_engine=paper_engine,
-                        candles_htf=best_candles_4h,
-                    )
-                    if _pyramid_ord:
-                        logger.info(f"[Pyramiding] {_pyramiding_signal.inst_id} 加仓完成 (ord={_pyramid_ord})")
-                    else:
-                        logger.warning(f"[Pyramiding] {_pyramiding_signal.inst_id} 加仓被拦截或下单失败")
+                    # 修复 P1-6: 加仓前检查聚合敞口上限（fail-closed） —
+                    # 此前多轮 0.5× 加仓无聚合限制，名义敞口可数倍于上限。
+                    # 持仓查询失败或敞口已达上限时一律放弃加仓。
+                    _pyramid_cap_ok = _exposure_cap_allows_add(
+                        client, equity, config)
+                    if not _pyramid_cap_ok:
+                        logger.warning(
+                            f"[Pyramiding] {_pyramiding_signal.inst_id} "
+                            f"聚合敞口已达上限(或持仓查询失败)，放弃加仓"
+                        )
+                    if _pyramid_cap_ok:
+                        _info = client.get_instrument_info(_pyramiding_signal.inst_id)
+                        if _info is None:
+                            logger.warning(
+                                f"[Pyramiding] {_pyramiding_signal.inst_id} "
+                                f"无法获取合约信息，放弃加仓"
+                            )
+                            _pyramid_cap_ok = False
+                    if _pyramid_cap_ok:
+                        # 减半风险比例用于加仓
+                        _pyramid_config = copy.deepcopy(config)
+                        _pyramid_config["risk"]["risk_per_trade_pct"] = \
+                            _pyramid_config["risk"].get("risk_per_trade_pct", 1.0) * 0.5
+                        _pyramid_ord = _execute_signal_with_quant_enhancements(
+                            client=client,
+                            signal=_pyramiding_signal,
+                            equity=equity,
+                            config=_pyramid_config,
+                            instrument_info=_info,
+                            state_manager=state_manager,
+                            risk_committee=risk_committee,
+                            market_guard=market_guard,
+                            market_state=market_state,
+                            signal_tracker=signal_tracker,
+                            analysis=best_analysis,
+                            debate_result=best_debate_result,
+                            candles_1h=best_candles_1h,
+                            funding_rate=best_funding_rate,
+                            regime=best_regime,
+                            paper_engine=paper_engine,
+                            candles_htf=best_candles_4h,
+                        )
+                        if _pyramid_ord:
+                            logger.info(
+                                f"[Pyramiding] {_pyramiding_signal.inst_id} "
+                                f"加仓完成 (ord={_pyramid_ord})"
+                            )
+                        else:
+                            logger.warning(
+                                f"[Pyramiding] {_pyramiding_signal.inst_id} "
+                                f"加仓被拦截或下单失败"
+                            )
                     # 刷新 positions
                     positions = _refresh_positions()
                     active_count = len([p for p in positions.values() if p["size"] > 0])
@@ -5100,7 +5301,7 @@ def main():
         except KeyboardInterrupt:
             logger.info("用户中断。正在保存状态...")
             break
-        except (ConnectionError, TimeoutError, OSError, RuntimeError, ValueError) as e:
+        except (ConnectionError, TimeoutError, OSError, RuntimeError, ValueError, OKXQueryError) as e:
             _restart_count += 1
             if _restart_count > _max_restarts:
                 logger.critical(
@@ -5110,6 +5311,14 @@ def main():
                 break
             # Cleanup before restart — prevent resource leaks
             logger.error(f"Main loop crashed: {e}")
+            # 修复 P0-D: 崩溃-重启路径进程未退出、atexit 不触发，
+            # 必须先落盘（否则最后一轮内存变更最长丢失一个扫描周期）
+            _sm = _cleanup_registry.get("state_manager")
+            if _sm is not None:
+                try:
+                    _sm.save()
+                except Exception as _se:
+                    logger.error(f"崩溃前保存状态失败: {_se}")
             _ws = _cleanup_registry.get("ws_cache")
             if _ws:
                 try:

@@ -15,10 +15,16 @@ TradingAgents 核心设计：
   5. Decision Log Injection — 历史决策反思注入未来研判
 """
 
+# 修复: 延迟注解求值 — SimpleDebateResult 定义在 L1091，被 L887 等方法注解
+# 先引用，Python 3.10+ 默认立即求值注解导致 import 时 NameError
+from __future__ import annotations
+
+import concurrent.futures
 import json
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -173,16 +179,24 @@ class TradingAgentsDebateEngine:
         debate_rounds: int = 2,
         min_agreement: float = 0.50,
         checkpoint_dir: Optional[str] = None,
+        debate_timeout: float = 30.0,
     ):
         self.analysts = analysts or DEFAULT_ANALYST_TEAM
         self.debate_rounds = debate_rounds
         self.min_agreement = min_agreement
         self.checkpoint_dir = checkpoint_dir
+        self.debate_timeout = debate_timeout
 
         # 分析师索引
         self._analyst_index: Dict[str, AnalystProfile] = {
             a.name: a for a in self.analysts
         }
+
+        # 修复 Bug 31: 按币种（symbol）独立维护分析师信誉，
+        # 避免 BTC 分析师在其他币种上的成败污染全局信誉
+        # 结构: {symbol: {analyst_name: {"total_analyses": N, "correct_calls": N, "reputation": F, "weight": F}}}
+        self._reputation_by_symbol: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._rep_lock = threading.Lock()
 
     def conduct_debate(
         self,
@@ -209,10 +223,31 @@ class TradingAgentsDebateEngine:
             timestamp=time.time(),
         )
 
+        _debate_start = time.time()
+
         # ---- Phase 1: 分析师独立研判 ----
         result.opinions = self._phase_analyst_analysis(
             symbol, channel_reports, fvg_signals, current_price, regime
         )
+
+        # 修复 H6: 超时保护 — 防止 LLM API 阻塞导致辩论永久挂起
+        _elapsed = time.time() - _debate_start
+        if _elapsed > self.debate_timeout:
+            logger.warning(
+                f"[Debate] {symbol} 辩论超时 ({_elapsed:.1f}s > {self.debate_timeout}s)，"
+                f"返回部分结果 (Phase 1 完成)"
+            )
+            result.total_rounds = 0
+            result.final_score = 0.0
+            result.confidence = 0.0
+            result.winner = "tie"
+            result.verdict = f"辩论超时 ({_elapsed:.1f}s)，无法完成完整研判，建议观望"
+            result.risk_assessment = "辩论超时，风险评估不完整"
+            result.action_recommendation = "建议观望。辩论超时未完成，不做也是一种交易。"
+            return result
+
+        # 修复 Bug 31: 应用按 symbol 隔离的分析师权重
+        self.apply_symbol_weights(symbol, result.opinions)
 
         # ---- Phase 2: 结构化辩论 ----
         result.rounds, result.disagreements, result.consensus_points = \
@@ -220,13 +255,46 @@ class TradingAgentsDebateEngine:
 
         result.total_rounds = len(result.rounds)
 
+        _elapsed = time.time() - _debate_start
+        if _elapsed > self.debate_timeout:
+            logger.warning(
+                f"[Debate] {symbol} 辩论超时 ({_elapsed:.1f}s > {self.debate_timeout}s)，"
+                f"返回部分结果 (Phase 2 完成)"
+            )
+            result.total_rounds = len(result.rounds)
+            result.final_score = 0.0
+            result.confidence = 0.0
+            result.winner = "tie"
+            result.verdict = f"辩论超时 ({_elapsed:.1f}s)，无法完成完整研判，建议观望"
+            result.risk_assessment = "辩论超时，风险评估不完整"
+            result.action_recommendation = "建议观望。辩论超时未完成，不做也是一种交易。"
+            return result
+
         # ---- Phase 3: 综合研判 ----
         result.final_score, result.confidence, result.winner = \
             self._phase_synthesis(result)
 
+        _elapsed = time.time() - _debate_start
+        if _elapsed > self.debate_timeout:
+            logger.warning(
+                f"[Debate] {symbol} 辩论超时 ({_elapsed:.1f}s > {self.debate_timeout}s)，"
+                f"返回部分结果 (Phase 3 完成)"
+            )
+            result.verdict = f"辩论超时 ({_elapsed:.1f}s)，研判已完成但结论生成超时"
+            result.risk_assessment = "辩论超时后风险评估不完整"
+            result.action_recommendation = "建议谨慎。辩论超时，减轻仓位。"
+            return result
+
         # ---- Phase 4: 生成结论 ----
         result.verdict, result.risk_assessment, result.action_recommendation = \
             self._phase_verdict(result, regime)
+
+        # ---- 确定性验证层：检查生成结论的有效性 ----
+        if not self._validate_analysis_output(result.verdict, result.winner):
+            logger.warning("Verdict validation failed, falling back to rule-based scoring")
+            signal_data = self._build_signal_data_dict(fvg_signals, channel_reports)
+            fallback = self._compute_rule_based_score(signal_data)
+            return self._convert_fallback_to_debate_result(fallback, symbol)
 
         return result
 
@@ -383,9 +451,9 @@ class TradingAgentsDebateEngine:
                 red_flags.append("相关性体制背离")
                 bearish_score += 0.15
 
-            # 风控官不轻易给出方向
+            # 风控官连续评分：基于红旗数量，避免二值化跃迁
             bullish_score = max(0, bullish_score - 0.1)
-            bearish_score = min(1.0, bearish_score)
+            bearish_score = max(bearish_score, min(1.0, len(all_reds) * 0.2))
 
         # 归一化
         total = bullish_score + bearish_score
@@ -484,10 +552,8 @@ class TradingAgentsDebateEngine:
             # 交叉质询后调整评分
             if regime == "FUSED":
                 # 共振体制下，多数派得分更高
-                if len(bulls) > len(bears):
-                    round2_score = round1_score * 1.2
-                elif len(bears) > len(bulls):
-                    round2_score = round1_score * 1.2
+                if len(bulls) != len(bears):
+                    round2_score = max(-1.0, min(1.0, round1_score * 1.2))
                 else:
                     round2_score = round1_score
             elif regime == "DIVERGENT":
@@ -512,11 +578,13 @@ class TradingAgentsDebateEngine:
             all_reds.update(o.red_flags)
             all_evidence.update(o.evidence)
 
-        # 分歧点：正反双方都提到的红旗
+        # 分歧点：正反双方都提到的红旗（注：当前为简化实现，使用 red_flags 作为分歧点；
+        # 实际分歧应为多空双方对同一维度的对立观点，不是风险警告。
+        # 更准确的实现应比较 bulls 和 bears 的 reasoning 中冲突的论点）
         disagreements = list(all_reds)[:5]
 
         # 共识点：多数分析师同意的方向
-        if len(bulls) >= len(opinions) * 0.6:
+        if len(opinions) > 0 and len(bulls) >= len(opinions) * 0.6:
             consensus_points = ["多数分析师看多"]
         elif len(bears) >= len(opinions) * 0.6:
             consensus_points = ["多数分析师看空"]
@@ -668,28 +736,67 @@ class TradingAgentsDebateEngine:
 
     def update_analyst_reputation(
         self,
+        symbol: str,
         analyst_name: str,
         was_correct: bool,
         learning_rate: float = 0.05,
     ):
-        """更新分析师信誉 — 正确预测加分，错误减分。"""
-        analyst = self._analyst_index.get(analyst_name)
-        if not analyst:
+        """按 symbol 隔离更新分析师信誉 — 正确预测加分，错误减分。
+
+        修复 Bug 31: 每个币种独立维护信誉表，避免 BTC 分析师的表现在
+        其他币种上污染全局信誉。
+        """
+        if not symbol or not analyst_name:
             return
 
-        analyst.total_analyses += 1
-        if was_correct:
-            analyst.correct_calls += 1
+        with self._rep_lock:
+            if symbol not in self._reputation_by_symbol:
+                self._reputation_by_symbol[symbol] = {}
 
-        # 更新信誉
-        if analyst.total_analyses > 0:
-            raw_rep = analyst.correct_calls / analyst.total_analyses
-            # 贝叶斯平滑，避免小样本极端
-            analyst.reputation = (raw_rep * analyst.total_analyses + 0.5 * 10) / \
-                                 (analyst.total_analyses + 10)
+            sym_table = self._reputation_by_symbol[symbol]
+            if analyst_name not in sym_table:
+                sym_table[analyst_name] = {
+                    "total_analyses": 0,
+                    "correct_calls": 0,
+                    "reputation": 0.5,
+                    "weight": 0.20,
+                }
 
-        # 调整权重
-        analyst.weight = 0.10 + analyst.reputation * 0.20
+            rep = sym_table[analyst_name]
+            rep["total_analyses"] += 1
+            if was_correct:
+                rep["correct_calls"] += 1
+
+            # 贝叶斯平滑信誉
+            # 修复 H7: 降低先验强度 (0.5, 10) → (0.5, 2)，给新分析师更多初始权重
+            # 旧公式: (raw_rep * N + 0.5*10) / (N+10) → 新分析师 rep ≈ 0.05
+            # 新公式: (raw_rep * N + 0.5*2) / (N+2) → 新分析师 rep ≈ 0.33
+            if rep["total_analyses"] > 0:
+                raw_rep = rep["correct_calls"] / rep["total_analyses"]
+                rep["reputation"] = (raw_rep * rep["total_analyses"] + 0.5 * 2) / \
+                                    (max(rep["total_analyses"], 1) + 2)
+
+            # 调整权重 (0.10 ~ 0.30)
+            rep["weight"] = 0.10 + rep["reputation"] * 0.20
+
+    def get_analyst_weight(self, symbol: str, analyst_name: str) -> float:
+        """获取指定币种下指定分析师的当前权重（无记录时返回默认 0.20）。"""
+        with self._rep_lock:
+            if symbol in self._reputation_by_symbol:
+                entry = self._reputation_by_symbol[symbol].get(analyst_name)
+                if entry:
+                    return entry["weight"]
+        return 0.20
+
+    def apply_symbol_weights(
+        self,
+        symbol: str,
+        opinions: List["AnalystOpinion"],
+    ) -> None:
+        """将指定币种的信誉权重同步到意见列表中的 weight 字段（原地修改）。"""
+        for op in opinions:
+            w = self.get_analyst_weight(symbol, op.analyst_name)
+            op.weight = w
 
     # ------------------------------------------------------------------
     # Checkpoint 持久化
@@ -715,15 +822,8 @@ class TradingAgentsDebateEngine:
                 "verdict": result.verdict,
                 "risk_assessment": result.risk_assessment,
                 "action_recommendation": result.action_recommendation,
-                "analyst_reputations": {
-                    a.name: {
-                        "reputation": a.reputation,
-                        "total_analyses": a.total_analyses,
-                        "correct_calls": a.correct_calls,
-                        "weight": a.weight,
-                    }
-                    for a in self.analysts
-                },
+                # 修复 Bug 31: 持久化按 symbol 隔离的信誉表
+                "reputation_by_symbol": self._reputation_by_symbol,
             }
             with open(checkpoint_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -743,20 +843,190 @@ class TradingAgentsDebateEngine:
             with open(checkpoint_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # 恢复分析师信誉
-            if "analyst_reputations" in data:
-                for name, rep in data["analyst_reputations"].items():
-                    if name in self._analyst_index:
-                        a = self._analyst_index[name]
-                        a.reputation = rep["reputation"]
-                        a.total_analyses = rep["total_analyses"]
-                        a.correct_calls = rep["correct_calls"]
-                        a.weight = rep["weight"]
+            # 修复 Bug 31: 恢复按 symbol 隔离的信誉表
+            if "reputation_by_symbol" in data:
+                self._reputation_by_symbol = data["reputation_by_symbol"]
 
             return data
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             return None
+
+
+# ------------------------------------------------------------------
+    # 确定性验证层 + 规则降级
+    # ------------------------------------------------------------------
+
+    def _validate_analysis_output(self, response: str, signal_type: str) -> bool:
+        """确定性验证层 — 检查 LLM 输出是否在合理范围内。
+
+        验证项：
+        1. 是否包含置信度评分（0-100）
+        2. 是否包含方向判断（long/short/neutral）
+        3. 输出长度是否异常（空或过长）
+        4. 评分是否在合理范围（0-100）
+        """
+        if not response or len(response) < 10:
+            return False
+        if len(response) > 5000:
+            logger.warning(f"LLM output too long: {len(response)} chars")
+            return False
+        # 检查关键字段存在
+        has_confidence = any(kw in response.lower() for kw in ["confidence", "置信", "score", "评分"])
+        has_direction = any(kw in response.lower() for kw in [
+            "long", "short", "bullish", "bearish",
+            "多头", "空头", "做多", "做空",
+            "看多", "看空", "多方", "空方", "多空",
+        ])
+        if not has_confidence or not has_direction:
+            logger.warning("LLM output missing confidence or direction")
+            return False
+        # 交叉验证：判词方向应与 winner 一致
+        if signal_type == "bullish" and not any(kw in response for kw in ["看多", "多方", "bullish", "long"]):
+            return False
+        if signal_type == "bearish" and not any(kw in response for kw in ["看空", "空方", "bearish", "short"]):
+            return False
+        return True
+
+    def _compute_rule_based_score(self, signal_data: dict) -> SimpleDebateResult:
+        """纯规则评分（LLM 不可用时的降级方案）。"""
+        score = 0.5  # 中性基准
+        # FVG 宽度加分
+        if signal_data.get("fvg_width_pct", 0) > 2.0:
+            score += 0.1
+        # 成交量确认加分
+        if signal_data.get("volume_ratio", 0) > 1.5:
+            score += 0.1
+        # 资金费率方向加分
+        fr = signal_data.get("funding_rate", 0)
+        direction = signal_data.get("direction", "long")
+        if direction == "long" and fr < 0:
+            score += 0.05
+        elif direction == "short" and fr > 0:
+            score += 0.05
+        # 多周期加分
+        if signal_data.get("multi_tf_aligned", False):
+            score += 0.1
+        if direction == "long":
+            winner = "bullish"
+        elif direction == "short":
+            winner = "bearish"
+        else:
+            winner = "tie"
+        return SimpleDebateResult(
+            bullish_points=[],
+            bearish_points=[],
+            winner=winner,
+            score_margin=0.0,
+            net_verdict=f"规则降级评分: confidence={min(score, 1.0):.0%}",
+            confidence=min(score, 1.0),
+            agreement=0.5,
+            key_points=[],
+        )
+
+    def _build_signal_data_dict(
+        self,
+        fvg_signals: List[Any],
+        channel_reports: List[Any],
+    ) -> dict:
+        """从 FVG 信号和通道报告中提取规则评分所需的数据字典。"""
+        signal_data: dict = {
+            "fvg_width_pct": 0.0,
+            "volume_ratio": 0.0,
+            "funding_rate": 0.0,
+            "direction": "long",
+            "multi_tf_aligned": False,
+        }
+
+        if fvg_signals:
+            best = fvg_signals[0]
+            signal_data["fvg_width_pct"] = getattr(best.fvg, "width_pct", 0.0)
+            signal_data["volume_ratio"] = getattr(best.fvg, "volume_ratio", 1.0)
+            signal_data["direction"] = best.position_side
+
+            # 多周期对齐检测
+            tfs = set()
+            directions = {}
+            for s in fvg_signals:
+                tf = getattr(s.fvg, "timeframe", "")
+                tfs.add(tf)
+                if tf not in directions:
+                    directions[tf] = set()
+                directions[tf].add(s.position_side)
+            if len(tfs) >= 2:
+                # 检查是否所有时间周期方向一致
+                all_dirs = set()
+                for dset in directions.values():
+                    all_dirs.update(dset)
+                if len(all_dirs) == 1:
+                    signal_data["multi_tf_aligned"] = True
+
+        # 从资金流向通道提取资金费率
+        for ch in channel_reports:
+            if hasattr(ch, "channel_name") and ch.channel_name == "资金流向":
+                if hasattr(ch, "raw_data") and ch.raw_data:
+                    fr = ch.raw_data.get("funding_rate")
+                    if fr is not None:
+                        signal_data["funding_rate"] = float(fr)
+                break
+
+        return signal_data
+
+    def conduct_debate_with_timeout(
+        self,
+        symbol: str,
+        channel_reports: List[Any],
+        fvg_signals: List[Any],
+        current_price: float,
+        regime: str = "NEUTRAL",
+        timeout_sec: float = 30.0,
+    ) -> DebateResult:
+        """带超时保护的辩论执行。
+
+        在超时或异常时降级为纯规则评分，避免阻塞主循环。
+        """
+        signal_data = self._build_signal_data_dict(fvg_signals, channel_reports)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    self.conduct_debate,
+                    symbol, channel_reports, fvg_signals, current_price, regime,
+                )
+                return future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"Debate timed out after {timeout_sec}s, falling back to rule-based")
+            fallback = self._compute_rule_based_score(signal_data)
+            return self._convert_fallback_to_debate_result(fallback, symbol)
+        except Exception as e:
+            logger.error(f"Debate failed: {e}, falling back to rule-based")
+            fallback = self._compute_rule_based_score(signal_data)
+            return self._convert_fallback_to_debate_result(fallback, symbol)
+
+    def _convert_fallback_to_debate_result(
+        self,
+        fallback: SimpleDebateResult,
+        symbol: str,
+    ) -> DebateResult:
+        """将 SimpleDebateResult 转换为 DebateResult。"""
+        # Bug M-12: 降级结果 final_score 基于 winner 设置，避免矛盾
+        if fallback.winner == "bullish":
+            final_score = fallback.confidence
+        elif fallback.winner == "bearish":
+            final_score = -fallback.confidence
+        else:
+            final_score = 0.0
+
+        return DebateResult(
+            symbol=symbol,
+            timestamp=time.time(),
+            winner=fallback.winner,
+            final_score=final_score,
+            confidence=fallback.confidence,
+            verdict=fallback.net_verdict,
+            risk_assessment="辩论超时/异常，使用规则降级评分",
+            action_recommendation="建议观望。辩论未完成，规则降级评分置信度有限。",
+        )
 
 
 # ===========================================================================
@@ -786,11 +1056,16 @@ def inject_past_reflections(
     same_symbol = [d for d in recent_decisions if d.symbol == symbol]
     if same_symbol:
         recent = same_symbol[-max_reflections:]
-        wins = sum(1 for d in recent if d.is_win)
+        # 修复 Bug 48: 胜率统一以 pnl 符号为准
+        wins = sum(1 for d in recent if d.pnl > 0)
+        losses = sum(1 for d in recent if d.pnl < 0)
+        break_evens = sum(1 for d in recent if d.pnl == 0)
         total = len(recent)
+        decisive = wins + losses
+        win_rate = wins / decisive if decisive > 0 else 0.0
         parts.append(
             f"【历史参考】{symbol} 最近 {total} 次决策: "
-            f"胜率 {wins/total:.0%} ({wins}W/{total-wins}L)"
+            f"胜率 {win_rate:.0%} ({wins}W/{losses}L/{break_evens}BE)"
         )
         if recent:
             last = recent[-1]
@@ -826,6 +1101,8 @@ class SimpleDebateResult:
     score_margin: float             # 正=多方胜, 负=空方胜
     net_verdict: str                # 综合结论
     confidence: float
+    agreement: float = 0.0          # 分析师一致性 (0-1)
+    key_points: List[str] = field(default_factory=list)  # 关键论点
 
 
 def run_enhanced_debate(
@@ -923,7 +1200,7 @@ def format_debate_report(result: DebateResult) -> str:
     # 分析师投票
     lines.append("│  【分析师投票】".ljust(61) + "│")
     for o in result.opinions:
-        icon = "🔴" if o.direction == "bullish" else ("🟢" if o.direction == "bearish" else "⚪")
+        icon = "🟢" if o.direction == "bullish" else ("🔴" if o.direction == "bearish" else "⚪")
         lines.append(
             f"│    {icon} [{o.analyst_name}] {o.direction.upper():7s} "
             f"score={o.score:+.2f} conv={o.conviction:.0%}".ljust(61) + "│"

@@ -21,8 +21,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import dataclass, field
 from itertools import product
 from typing import Optional, List, Dict, Tuple, Callable, Any
 
@@ -104,10 +103,11 @@ DEFAULT_PARAM_SPACE = [
 @dataclass
 class StrategyMetrics:
     """策略性能指标 — 借鉴 freqtrade 的 backtesting 分析。"""
-    # 基础指标
+    # 交易统计
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
+    break_even_trades: int = 0          # 保本交易数（pnl == 0）— 修复 Bug 39
     win_rate: float = 0.0
 
     # 收益指标
@@ -146,6 +146,7 @@ def compute_metrics(
     trades: List[TradeRecord],
     initial_equity: float = 1000.0,
     risk_free_rate: float = 0.02,
+    interval: str = "1H",
 ) -> StrategyMetrics:
     """计算策略性能指标。
 
@@ -154,6 +155,12 @@ def compute_metrics(
       - 风险调整收益 (Sharpe, Sortino, Calmar)
       - 稳定性指标 (连赢/连亏)
       - 综合评分
+
+    Args:
+        trades: 交易记录列表
+        initial_equity: 初始资金
+        risk_free_rate: 年化无风险利率
+        interval: K 线周期，用于 Sharpe/Sortino 年化（修复 Bug 40）
     """
     m = StrategyMetrics()
 
@@ -161,11 +168,15 @@ def compute_metrics(
         return m
 
     m.total_trades = len(trades)
-    wins = [t for t in trades if t.is_win]
-    losses = [t for t in trades if not t.is_win]
+    # 修复 Bug 39/Bug 48: 胜率统计统一以 pnl 符号为准，保本不计入胜率分母
+    wins = [t for t in trades if t.pnl > 0]
+    losses = [t for t in trades if t.pnl < 0]
+    break_evens = [t for t in trades if t.pnl == 0]
     m.winning_trades = len(wins)
     m.losing_trades = len(losses)
-    m.win_rate = m.winning_trades / m.total_trades if m.total_trades > 0 else 0
+    m.break_even_trades = len(break_evens)
+    m.win_rate = m.winning_trades / (m.winning_trades + m.losing_trades) \
+        if (m.winning_trades + m.losing_trades) > 0 else 0
 
     # 收益指标
     total_return = sum(t.pnl for t in trades)
@@ -182,7 +193,7 @@ def compute_metrics(
     # 期望值
     avg_win = np.mean([t.pnl for t in wins]) if wins else 0
     avg_loss = abs(np.mean([t.pnl for t in losses])) if losses else 0
-    m.expectancy = (m.win_rate * avg_win - (1 - m.win_rate) * avg_loss)
+    m.expectancy = sum(t.pnl for t in trades) / len(trades)
     m.expectancy_ratio = m.expectancy / avg_loss if avg_loss > 0 else 0
 
     # 最大回撤
@@ -208,34 +219,71 @@ def compute_metrics(
     m.max_drawdown_duration = max_dd_duration
 
     # 风险调整收益
-    returns = np.array([t.pnl_pct / 100 for t in trades])
-    if len(returns) > 1 and np.std(returns) > 0:
-        m.sharpe_ratio = (np.mean(returns) - risk_free_rate / 365) / np.std(returns) * np.sqrt(365)
+    # H-21: 构建权益曲线，计算标准日收益率序列，用 sqrt(365) 年化
+    if len(trades) > 1:
+        # 按出场时间排序，构建权益曲线
+        sorted_trades = sorted(trades, key=lambda t: t.exit_time)
+        equity = initial_equity
+        equity_curve = [equity]
+        times = [sorted_trades[0].entry_time]
+        for t in sorted_trades:
+            equity *= (1 + t.pnl_pct / 100)
+            equity_curve.append(equity)
+            times.append(t.exit_time)
 
-        # Sortino (只考虑下行波动)
-        downside = returns[returns < 0]
-        downside_std = np.std(downside) if len(downside) > 1 else np.std(returns)
-        m.sortino_ratio = (np.mean(returns) - risk_free_rate / 365) / downside_std * np.sqrt(365) \
-            if downside_std > 0 else 0
+        times = np.array(times)
+        equity_curve = np.array(equity_curve)
 
-        # Calmar
-        m.calmar_ratio = (m.total_return_pct / 100) / (m.max_drawdown_pct / 100) \
-            if m.max_drawdown_pct > 0 else 0
+        total_days = (times[-1] - times[0]) / 86400.0
+        if total_days > 0:
+            # M-16: 使用每笔交易的实际持有天数而非 exit_time 的差值
+            daily_returns = []
+            for t in sorted_trades:
+                holding_days = max(1.0, (t.exit_time - t.entry_time) / 86400.0)
+                daily_ret = (1 + t.pnl_pct / 100) ** (1.0 / holding_days) - 1
+                daily_returns.append(daily_ret)
+            daily_returns = np.array(daily_returns)
 
-    # 连赢/连亏
+            daily_mean = np.mean(daily_returns)
+            daily_std = np.std(daily_returns, ddof=1) if len(daily_returns) > 1 else 0
+
+            if daily_std > 0:
+                # Sharpe = (annualized_return - risk_free_rate) / annualized_std
+                # 与 optimization.py 保持一致，risk_free_rate = 0.02
+                m.sharpe_ratio = (daily_mean * 365 - risk_free_rate) / (daily_std * np.sqrt(365))
+            else:
+                m.sharpe_ratio = 0.0
+
+            # Sortino (只考虑下行波动)
+            downside_returns = daily_returns[daily_returns < 0]
+            downside_std = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else daily_std
+            m.sortino_ratio = (daily_mean * 365 - risk_free_rate) / (downside_std * np.sqrt(365)) \
+                if downside_std > 0 else 0
+
+            # C-15: Calmar = 年化收益率 / 最大回撤
+            # 使用对数计算 CAGR，避免 total_days 极小导致幂运算溢出
+            total_days = max(total_days, 1.0)
+            annual_return = math.exp(
+                math.log(equity_curve[-1] / equity_curve[0]) * 365.0 / total_days
+            ) - 1.0
+            m.calmar_ratio = annual_return / (m.max_drawdown_pct / 100) \
+                if m.max_drawdown_pct > 0 else 0
+
+    # 连赢/连亏 — 修复 Bug 55: 统一以 pnl 符号为准，保本不计数
     cons_wins = 0
     cons_losses = 0
     max_cons_wins = 0
     max_cons_losses = 0
     for t in trades:
-        if t.is_win:
+        if t.pnl > 0:
             cons_wins += 1
             cons_losses = 0
             max_cons_wins = max(max_cons_wins, cons_wins)
-        else:
+        elif t.pnl < 0:
             cons_losses += 1
             cons_wins = 0
             max_cons_losses = max(max_cons_losses, cons_losses)
+        # pnl == 0 保本：不增加任何连赢/连亏计数
     m.consecutive_wins = cons_wins
     m.consecutive_losses = cons_losses
     m.max_consecutive_wins = max_cons_wins
@@ -264,8 +312,9 @@ def _compute_composite_score(m: StrategyMetrics) -> float:
     score += min(m.win_rate * 100, 100) * 0.20
 
     # 盈亏比 (20%)
-    if m.profit_factor > 0 and m.profit_factor < float("inf"):
-        score += min(m.profit_factor * 20, 100) * 0.20
+    if m.profit_factor > 0:
+        pf = min(m.profit_factor, 5.0) if m.profit_factor != float("inf") else 5.0
+        score += pf * 20 * 0.20
 
     # 期望值 (20%)
     score += min(max(m.expectancy_ratio * 20, 0), 100) * 0.20
@@ -279,6 +328,9 @@ def _compute_composite_score(m: StrategyMetrics) -> float:
 
     # 样本量 (10%)
     score += min(m.total_trades / 50 * 100, 100) * 0.10
+
+    # L-6: 小样本惩罚 — 交易数 < 50 时按比例降低综合评分
+    score *= min(1.0, m.total_trades / 50.0)
 
     return min(score, 100)
 
@@ -300,8 +352,12 @@ class HyperoptResult:
 class BayesianHyperopt:
     """贝叶斯启发式参数优化器 — 借鉴 freqtrade Hyperopt。
 
-    不使用外部 Hyperopt 库，而是实现：
-      1. 粗粒度网格搜索 → 确定有希望区域
+    注意: 当前实现使用随机搜索 + 局部细化，非传统贝叶斯优化。
+    不包含高斯过程、采集函数 (acquisition function) 或后验分布。
+    未来版本将集成高斯过程 (GP) 实现真正的贝叶斯优化。
+
+    当前流程：
+      1. 粗粒度随机采样 → 确定有希望区域
       2. 自适应细化 → 在最优区域附近精细搜索
       3. 参数重要性分析 → 识别关键参数
     """
@@ -355,11 +411,12 @@ class BayesianHyperopt:
                 except Exception as e:
                     logger.debug(f"Refined params {params} failed: {e}")
 
+            prev_best = best_score
             all_results.sort(key=lambda x: x[1], reverse=True)
             best_params, best_score = all_results[0]
 
             # 如果不再改善，提前退出
-            if refine_round > 0 and all_results[0][1] <= best_score * 1.001:
+            if refine_round > 0 and all_results[0][1] <= prev_best * 1.001:
                 break
 
         # ---- Phase 3: 参数重要性分析 ----
@@ -377,7 +434,7 @@ class BayesianHyperopt:
         )
 
     def _build_initial_grid(self) -> List[Dict[str, Any]]:
-        """构建初始搜索网格。"""
+        """构建初始搜索网格 — 使用随机采样替代笛卡尔积，避免组合爆炸。"""
         param_values = {}
         for name, p in self.param_space.items():
             values = p.sample(self.n_initial)
@@ -386,10 +443,22 @@ class BayesianHyperopt:
                 values.append(p.default)
             param_values[name] = values
 
-        # 笛卡尔积
+        # 随机采样 N 个组合，避免笛卡尔积爆炸（5^10 ≈ 10M）
         names = list(param_values.keys())
-        combos = list(product(*[param_values[n] for n in names]))
-        return [dict(zip(names, combo)) for combo in combos]
+        n_samples = min(500, max(200, self.n_initial * 30))
+        results = []
+        rng = np.random.RandomState(42)
+        for _ in range(n_samples):
+            combo = {name: rng.choice(param_values[name]) for name in names}
+            results.append(combo)
+
+        # 确保默认组合被包含
+        default_combo = {name: p.default for name, p in self.param_space.items()
+                         if p.default is not None}
+        if default_combo and default_combo not in results:
+            results.append(default_combo)
+
+        return results
 
     def _build_refined_grid(self, best_params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """在最优参数附近构建细化网格。"""
@@ -431,22 +500,23 @@ class BayesianHyperopt:
                 if name in params:
                     param_values.append(params[name])
 
-            if len(set(param_values)) > 1:
-                # 计算参数值与得分的相关性
-                numeric_values = []
-                for v in param_values:
-                    try:
-                        numeric_values.append(float(v))
-                    except (ValueError, TypeError):
-                        numeric_values.append(0.0)
-
-                if len(set(numeric_values)) > 1:
-                    corr = abs(np.corrcoef(numeric_values, scores)[0, 1])
-                    importance[name] = round(float(corr), 3)
-                else:
-                    importance[name] = 0.0
-            else:
+            if len(set(param_values)) <= 1:
                 importance[name] = 0.0
+                continue
+
+            # 计算参数值与得分的相关性
+            numeric_values = []
+            for v in param_values:
+                try:
+                    numeric_values.append(float(v))
+                except (ValueError, TypeError):
+                    numeric_values.append(0.0)
+
+            if len(set(numeric_values)) <= 1:
+                importance[name] = 0.0
+            else:
+                corr = np.corrcoef(numeric_values, scores)
+                importance[name] = abs(corr[0, 1]) if not np.isnan(corr[0, 1]) else 0.0
 
         # 归一化
         total = sum(importance.values())
@@ -498,13 +568,22 @@ def walk_forward_optimization(
 
     hyperopt = BayesianHyperopt(param_space, lambda p: 0.0, n_initial=4, n_refine=2)
 
-    for w in range(n_windows - 1):
+    for w in range(n_windows):
         start = w * window_size
         train_end = start + train_size
         test_end = min(train_end + test_size, total)
 
-        if test_end <= train_end:
+        # 最后一窗：确保 test 区间覆盖到数据末尾
+        if w == n_windows - 1:
+            test_end = total
+
+        if test_end <= train_end or train_end >= total:
             break
+
+        # L-5: 最后一窗样本量过小检查
+        if test_end - train_end < 5:
+            logger.warning(f"Window {w+1}: test_size={test_end - train_end} < 5，跳过此窗口")
+            continue
 
         train_trades = all_trades[start:train_end]
         test_trades = all_trades[train_end:test_end]
@@ -587,22 +666,34 @@ def compute_kelly(
             optimal_f=0, recommended_risk_pct=0, expected_growth_rate=0,
         )
 
-    wins = [t for t in trades if t.is_win]
-    losses = [t for t in trades if not t.is_win]
+    # 修复 Bug 56: Kelly 计算统一以 pnl 符号分类盈亏
+    wins = [t for t in trades if t.pnl > 0]
+    losses = [t for t in trades if t.pnl < 0]
 
-    win_rate = len(wins) / len(trades)
+    # 修复: 胜率分母剔除保本交易（pnl == 0），与 EdgeAnalyzer/hyperopt.py 一致
+    # 原先用 len(trades) 含保本，导致 Kelly 胜率被稀释，仓位偏保守
+    decisive = len(wins) + len(losses)
+    win_rate = len(wins) / decisive if decisive > 0 else 0
     avg_win_pct = np.mean([abs(t.pnl_pct) for t in wins]) if wins else 0
-    avg_loss_pct = np.mean([abs(t.pnl_pct) for t in losses]) if losses else 1.0
+    avg_loss_pct = np.mean([abs(t.pnl_pct) for t in losses]) if losses else avg_win_pct * 0.5
 
     if avg_loss_pct == 0:
         avg_loss_pct = 1.0
 
     # 盈亏比
     b = avg_win_pct / avg_loss_pct if avg_loss_pct > 0 else 1.0
+    # 修复: 极端行情下盈亏比裁剪，防止无限大或接近零导致的除以零
+    b = max(0.01, min(b, 100.0))
 
     # Kelly 公式
     q = 1 - win_rate
-    kelly_f = (win_rate * b - q) / b if b > 0 else 0
+    # 修复: 极端胜率裁剪，防止 q=0 或 p=0 导致的无意义计算
+    if win_rate >= 0.999:
+        kelly_f = 0.25  # 胜率极高时保守，避免过拟合
+    elif win_rate <= 0.001:
+        kelly_f = 0.0   # 几乎全败，Kelly 为负
+    else:
+        kelly_f = (win_rate * b - q) / b if b > 0 else 0
 
     # 限制范围
     kelly_f = max(0.0, min(kelly_f, 0.5))
@@ -612,7 +703,7 @@ def compute_kelly(
 
     # 期望增长率
     if kelly_f > 0:
-        expected_growth = win_rate * math.log(1 + kelly_f * b) + \
+        expected_growth = win_rate * math.log(max(1 + kelly_f * b, 1e-10)) + \
                           q * math.log(1 - kelly_f)
     else:
         expected_growth = 0.0
@@ -665,6 +756,11 @@ class FreqAIPipeline:
         self.trades_since_retrain: int = 0
         self.total_predictions: int = 0
         self.correct_predictions: int = 0
+        self._trained: bool = False
+
+        # 修复 M-2: 防数据中毒状态追踪，作为正式属性而非动态挂载
+        self._last_update_trade_count: int = -1
+        self._last_update_time: float = 0.0
 
     def extract_features(self, trade: TradeRecord) -> Dict[str, float]:
         """从交易记录中提取特征。"""
@@ -690,6 +786,7 @@ class FreqAIPipeline:
         y = []
         feature_names = list(features_list[0].keys())
         feature_names = [f for f in feature_names if f not in ("pnl_pct", "is_win")]
+        n_features = len(feature_names)
 
         for ft in features_list:
             X.append([ft.get(f, 0) for f in feature_names])
@@ -713,26 +810,44 @@ class FreqAIPipeline:
 
             self.feature_weights = dict(zip(feature_names, coef[:-1]))
             self.bias = coef[-1]
+            # C-16: 保存标准化参数，供 predict 使用
+            self.X_mean = X_mean
+            self.X_std = X_std
+            self._trained = True
         except Exception as e:
             logger.debug(f"FreqAI training failed: {e}")
+            # M-17: train() 失败时设置 fallback 标准化参数
+            self._trained = False
+            self.X_mean = np.zeros(n_features)
+            self.X_std = np.ones(n_features)
 
     def predict(self, features: Dict[str, float]) -> float:
         """预测期望 pnl_pct。"""
         if not self.feature_weights:
             return 0.0
 
+        # C-16: 对输入特征做与训练时相同的标准化
+        feature_names = list(self.feature_weights.keys())
+        X = np.array([features.get(f, 0) for f in feature_names])
+        if hasattr(self, 'X_mean') and hasattr(self, 'X_std'):
+            X = (X - self.X_mean) / self.X_std
+
         pred = self.bias
-        for name, weight in self.feature_weights.items():
-            pred += weight * features.get(name, 0)
+        for i, (name, weight) in enumerate(self.feature_weights.items()):
+            pred += weight * X[i]
 
         return float(pred)
 
     def update(self, new_trades: List[TradeRecord]):
         """在线更新模型。"""
+        # H-22: 维护完整交易历史，在新数据上累积后重训全部数据
+        if not hasattr(self, 'all_trades'):
+            self.all_trades = []
+        self.all_trades.extend(new_trades)
         self.trades_since_retrain += len(new_trades)
 
         if self.trades_since_retrain >= self.retrain_interval:
-            self.train(new_trades)
+            self.train(self.all_trades)
             self.trades_since_retrain = 0
 
     def get_prediction_accuracy(self) -> float:
@@ -793,11 +908,15 @@ def sensitivity_analysis(
     best_idx = np.argmax(scores)
     optimal_value = values[best_idx]
 
-    # 敏感性: 得分标准差 / 得分均值
+    # 敏感性: 得分标准差 / abs(得分均值)
+    # 使用 abs(score_mean) 作为分母，避免亏损策略（score_mean<0）被误判为"不敏感"
     score_array = np.array(scores)
     score_mean = np.mean(score_array)
     score_std = np.std(score_array)
-    sensitivity = float(score_std / score_mean) if score_mean > 0 else 0
+    if abs(score_mean) < 1e-6:
+        sensitivity = 1.0
+    else:
+        sensitivity = float(score_std / abs(score_mean))
 
     # 稳定区间: 得分 >= 最优得分 * 0.9 的范围
     threshold = scores[best_idx] * 0.9
@@ -830,6 +949,9 @@ def generate_performance_dashboard(
     m = compute_metrics(trades, initial_equity)
     kelly = compute_kelly(trades)
 
+    # 修复: pf_str 必须在列表构造之前计算，否则赋值语句会断裂列表
+    pf_str = "∞" if m.profit_factor == float("inf") else f"{m.profit_factor:>6.2f}"
+
     lines = [
         "",
         "╔" + "═" * 58 + "╗",
@@ -838,7 +960,7 @@ def generate_performance_dashboard(
         "",
         "  ┌─ 基础指标 ─────────────────────────────────┐",
         f"  │ 总交易: {m.total_trades:>6d}  胜率: {m.win_rate:>7.1%}            │",
-        f"  │ 盈利: {m.winning_trades:>6d}  亏损: {m.losing_trades:>6d}            │",
+        f"  │ 盈利: {m.winning_trades:>6d}  亏损: {m.losing_trades:>6d}  保本: {m.break_even_trades:>4d}  │",
         "  └────────────────────────────────────────────┘",
         "",
         "  ┌─ 收益指标 ─────────────────────────────────┐",
@@ -848,7 +970,7 @@ def generate_performance_dashboard(
         "",
         "  ┌─ 风险指标 ─────────────────────────────────┐",
         f"  │ 最大回撤: {m.max_drawdown_pct:>6.2f}%  持续: {m.max_drawdown_duration:>4d}笔  │",
-        f"  │ 盈利因子: {m.profit_factor:>6.2f}  期望值: {m.expectancy:>+8.2f}  │",
+        f"  │ 盈利因子: {pf_str}  期望值: {m.expectancy:>+8.2f}  │",
         "  └────────────────────────────────────────────┘",
         "",
         "  ┌─ 风险调整收益 ─────────────────────────────┐",
@@ -897,8 +1019,18 @@ def run_full_optimization(
     param_space: Optional[List[ParamSpace]] = None,
     initial_equity: float = 1000.0,
     n_windows: int = 5,
+    n_initial: int = 5,
+    n_refine: int = 2,
 ) -> Dict[str, Any]:
     """执行完整优化流程。
+
+    Args:
+        trades: 交易记录
+        param_space: 参数空间 (默认 DEFAULT_PARAM_SPACE)
+        initial_equity: 初始权益
+        n_windows: Walk-Forward 窗口数
+        n_initial: 贝叶斯优化初始采样数 (修复 2026-08-07: 读 config hyperopt.n_initial)
+        n_refine: 贝叶斯优化细化轮数 (修复 2026-08-07: 读 config hyperopt.n_refine)
 
     Returns:
         dict with:
@@ -931,7 +1063,7 @@ def run_full_optimization(
     def obj_wrapper(params):
         return objective_fn(trades, params)
 
-    hyperopt = BayesianHyperopt(param_space, obj_wrapper, n_initial=5, n_refine=2)
+    hyperopt = BayesianHyperopt(param_space, obj_wrapper, n_initial=n_initial, n_refine=n_refine)
     hyperopt_result = hyperopt.optimize()
 
     # 2. Walk-Forward

@@ -2,6 +2,57 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-07] 生产级审计修复批次（P0 全部 + P1 全部 + 关键 P2）
+
+基于完整生产审计（覆盖执行层/资金管理/状态恢复/策略/回测）落地的修复。
+**审计背景**：确认 3 个结构性爆仓级缺口（无强平距离校验、API 故障被静默当作"无持仓"、
+平仓记账在重启后断裂），全部在此批次修复。
+
+### P0 级（可致爆仓/资金损失）
+- **P0-A 强平距离校验（新增）**：`execute_signal` 开仓前硬校验
+  `|entry−SL| < 强平距离×安全系数`。强平距离 ≈ `1/杠杆 − MMR`（MMR 从
+  OKX position-tiers 档位获取，失败用保守默认 0.5%）。50x+3% 止损会被直接拒单。
+  此前全系统无强平价计算，跳空时止损单先于强平失效。
+- **P0-B API 故障 fail-closed**：`get_positions`/`get_pending_orders` 失败返回 `None`
+  （原静默返回 `[]`），调用方区分"查询失败"与"确无持仓"。根因是 python-okx SDK
+  底层为 httpx，其异常**不是**内置 `ConnectionError/OSError` 子类，旧重抛守卫永不触发。
+  已实测复核确认并全链路修复（monitor_positions 抛 `OKXQueryError`、risk_gate 敞口检查
+  拦截、close_position 核验、挂单管理跳过）。
+- **P0-C 交易端点退避重试**：`_call_sdk_retry` 助手覆盖 place_order /
+  place_algo_order / close_position / cancel_order / cancel_algo_order / set_leverage，
+  对 httpx 网络异常与限流码（50000/50011…）做 0.5s/1.5s/4s×3 重试。
+- **P0-D 平仓记账持久化**：`_pending_close` 拆出可序列化元数据
+  `pending_close_meta` 持久化，重启后重建续跑平仓确认（已实现盈亏/日亏限额不再丢）；
+  崩溃-重启路径补 `state_manager.save()`；两处无 try 的 `_refresh_positions()` 改为受保护刷新。
+- **P0-E 保护单登记校验**：trailing 登记已有保护单前校验 `posSide` 一致 +
+  挂单时间晚于开仓时间，过期孤儿单自动撤销重挂（此前重启后可能误登记旧保护单
+  → 新仓裸奔或错误价位触发）。
+
+### P1 级
+- 杠杆封顶 `max_position_leverage` 现在同步作用于 `set_leverage`（此前仅作用仓位计算）
+- 限价平仓 ≥90% 部分成交后残仓市价兜底（此前残仓滞留）
+- 平仓确认后联动撤销该币残留 oco/conditional 保护单（防止孤儿单）
+- 全链路持仓判定统一 `abs()`（兼容 cross 模式空头 pos 为负）
+- 换仓/反手/平仓后开新仓路径统一查 `_risk_breaker_triggered`（日亏限额 + 自适应暂停，
+  此前换仓在 risk_gate 之前执行可绕过）
+- 金字塔加仓前查聚合敞口上限（`_exposure_cap_allows_add`，fail-closed）
+- `get_positions` 移除 SDK 不支持的 `mgnMode` 透传（改为客户端侧过滤）
+
+### P2 级（关键项）
+- `clOrdId` 方法内生成一次、重试复用（幂等去重真正生效）
+- `market_guard.reduce_position_factor`（WARNING 减半仓）接线生效
+- 绝对回撤断路器补 `pause_until`（24h 冷却，日志与恢复语义一致）
+- 弱信号共振审核异常改 fail-closed（拒绝开仓）
+- 纸面模式平仓确认后清理 active_signals 条目；`paper_state.json` 补 fsync + .bak 恢复 +
+  数值字段强转；记忆文件改原子写
+
+### 验证
+- 新增回归测试 `test_production_fixes.py`（5 项：强平校验拒/放/档位MMR、pending_close
+  元数据往返、monitor_positions fail-closed）全部通过
+- `tests/` 目录 48 项单测全部通过；6 个改动文件 VS Code 诊断 0 错误
+- 注：`test_weak_gate.py`/`test_gala_lessons_gate.py` 为改动前已存在的测试夹具问题
+  （stash 对照确认），非本次回归
+
 ## [2026-08-07] WebSocket 行情缓存修复与心跳协议变更
 
 ### 变更原因（心跳协议）

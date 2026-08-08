@@ -1,8 +1,8 @@
-# OKX FVG 交易 Agent v3.1
+# OKX FVG 交易 Agent v3.2
 
 基于 Fair Value Gap (FVG) 的 OKX 永续合约自动交易机器人，融合 GitHub Top 3 开源项目精华。
 
-**v3.1 新特性：**
+**v3.2 新特性：**
 - 三挡研判系统（激进/均衡/保守），一键切换交易频率
 - 前 100 名合约全天候追踪研究
 - 亚洲/欧洲/美国三时段自动生成 HTML 研究报告，支持邮件推送
@@ -40,7 +40,7 @@
 
 ```
 okx_fvg_agent/
-├── agent.py            # 主循环入口 (v3.1)
+├── agent.py            # 主循环入口 (v3.2)
 ├── strategy.py         # FVG 检测 + 异常波动 + 信号生成
 ├── executor.py         # 仓位计算 + 下单 + 持仓监控 + 提现
 ├── okx_client.py       # OKX API v5 客户端 (支持代理/模拟盘)
@@ -52,7 +52,7 @@ okx_fvg_agent/
 ├── alpha_zoo.py        # Vibe-Trading Alpha 因子库 + 体制检测 + 记忆生命周期
 ├── coin_tracker.py     # 后台币种追踪研究（前 100 名合约）
 ├── report.py           # 定时 HTML 研究报告生成 + SMTP 邮件发送
-├── config.json         # 配置文件 (v3.1)
+├── config.json         # 配置文件 (v3.2)
 ├── requirements.txt    # Python 依赖
 ├── reports/            # 研究报告输出目录
 └── README.md           # 本文件

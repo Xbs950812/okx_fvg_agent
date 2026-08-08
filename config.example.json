@@ -1,5 +1,5 @@
 {
-  "_comment": "OKX FVG Trading Agent v3.0 — 复制为 config.json 并填入你的 API 密钥",
+  "_comment": "OKX FVG Trading Agent v3.2 — 复制为 config.json 并填入你的 API 密钥",
   "okx": {
     "api_key": "YOUR_API_KEY",
     "api_secret": "YOUR_API_SECRET",
@@ -47,10 +47,26 @@
   "alpha_zoo": {
     "_comment": "Vibe-Trading (23.6k⭐) Alpha 因子库 + 因果滞后体制检测",
     "enabled": true,
+    "factor_zoo_enabled": true,
     "min_factor_score": 40,
     "backtest_window": 100,
     "hysteresis_threshold": 0.15,
-    "min_regime_duration": 5
+    "min_regime_duration": 5,
+    "regime_enter_threshold": 0.65,
+    "regime_exit_threshold": 0.45,
+    "regime_corr_window": 60,
+    "regime_smooth_window": 5
+  },
+  "backtest": {
+    "_comment": "Vibe-Trading (23.6k⭐) 回测引擎 + 组合优化器 + 相关性分析",
+    "enabled": true,
+    "initial_capital": 10000,
+    "leverage": 3,
+    "risk_per_trade": 0.01,
+    "commission": 0.0005,
+    "slippage": 0.0001,
+    "market": "crypto",
+    "interval": "1H"
   },
   "freqai": {
     "_comment": "freqtrade (52k⭐) FreqAI 在线学习流水线",
@@ -71,7 +87,7 @@
     "adaptive_enabled": true,
     "trailing_stop_enabled": true,
     "trailing_stop_activation_pct": 0.5,
-    "trailing_stop_trail_pct": 0.3,
+    "trailing_stop_trail_pct": 0.03,
     "edge_lookback": 100,
     "consecutive_loss_pause": 5,
     "consecutive_loss_derate": 3
@@ -106,6 +122,13 @@
     "candle_ttl_seconds": 60,
     "warmup_top_n": 100
   },
+  "smart_money": {
+    "_comment": "聪明钱追踪 — 通过 OKX Copy Trading 公开接口获取 top 交易员共识持仓",
+    "enabled": true,
+    "top_n_traders": 20,
+    "min_traders_holding": 2,
+    "refresh_interval_cycles": 3
+  },
   "report": {
     "_comment": "定时研究报告 — 亚洲/欧美时段转换时生成报告",
     "enabled": true,
@@ -121,6 +144,53 @@
       "password": "YOUR_SMTP_AUTH_CODE",
       "recipients": ["your_email@qq.com"]
     }
+  },
+  "persistence": {
+    "_comment": "SQLite 数据持久化 — 信号/交易/预测/因子/体制",
+    "enabled": true,
+    "db_path": "quant_agent.db"
+  },
+  "market_guard": {
+    "_comment": "市场状态熔断 — 极端行情禁止开仓",
+    "enabled": true,
+    "btc_crisis_drop_pct": -8.0,
+    "volatility_spike_threshold": 5.0,
+    "breadth_crisis_threshold": 0.2,
+    "funding_extreme_threshold": 0.01,
+    "oi_spike_threshold": 0.3,
+    "recovery_cooldown_seconds": 1800
+  },
+  "risk_committee": {
+    "_comment": "AI 风险委员会 — 输出 0-100 Risk Score，量化规则做最终决策",
+    "enabled": true,
+    "low_risk_threshold": 30,
+    "high_risk_threshold": 70,
+    "crisis_threshold": 95
+  },
+  "factor_selector": {
+    "_comment": "因子选择器 — 从 461 因子中筛选核心因子，降低过拟合",
+    "enabled": true,
+    "target_factor_count": 35,
+    "max_correlation": 0.7,
+    "min_ic_abs": 0.03,
+    "min_ic_ir": 0.3,
+    "lookback_window": 60,
+    "reselect_interval_rounds": 100
+  },
+  "walk_forward": {
+    "_comment": "Walk Forward 验证 — 训练 70% / 验证 30%，检测过拟合",
+    "enabled": true,
+    "train_ratio": 0.7,
+    "n_windows": 1,
+    "overfit_threshold": 0.3,
+    "min_test_return": -0.5,
+    "interval_rounds": 100
+  },
+  "quant_report": {
+    "_comment": "每日量化报告 — 胜率/Profit Factor/Sharpe/回撤/置信度校准",
+    "enabled": true,
+    "report_dir": "reports",
+    "generate_hour_utc": 0
   },
   "agent": {
     "scan_interval_seconds": 300,

@@ -14,6 +14,8 @@ Vibe-Trading 核心设计：
   4. Correlation Regime — 增强版因果滞后状态机
   5. Memory Lifecycle — 增强版记忆生命周期
   6. Factor Analysis — 统计显著性检验框架
+
+HunHeng_OS_V1.0 — 集成 Vibe-Trading Alpha Zoo 461 因子 + 增强体制检测
 """
 
 import json
@@ -28,8 +30,31 @@ from typing import Optional, List, Dict, Tuple, Any, Callable, Set
 
 import numpy as np
 
-
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 从增强模块导入（Vibe-Trading 集成）
+# ---------------------------------------------------------------------------
+
+# 尝试导入增强版体制检测器（Schmitt-trigger + 边密度）
+try:
+    from regime_detector import (
+        CausalHysteresisRegime as EnhancedCausalHysteresisRegime,
+        EnhancedRegimeDetector,
+        compute_edge_density,
+        detect_regimes,
+        MarketRegime as RegimeDetectorMarketRegime,
+    )
+    _REGIME_ENHANCED = True
+except ImportError:
+    _REGIME_ENHANCED = False
+
+# 尝试导入因子库适配器（Alpha Zoo 461 因子）
+try:
+    from factor_zoo.adapter import FactorZooAdapter
+    _FACTOR_ZOO_AVAILABLE = True
+except ImportError:
+    _FACTOR_ZOO_AVAILABLE = False
 
 
 # ===========================================================================
@@ -278,6 +303,8 @@ class FactorOperator:
     @staticmethod
     def rank(values: np.ndarray) -> np.ndarray:
         """百分位排名 (0-1)。"""
+        if len(values) == 0:
+            return np.array([])
         n = len(values)
         if n <= 1:
             return np.zeros_like(values)
@@ -327,9 +354,12 @@ class FactorOperator:
         """加权和组合。"""
         if not factors:
             return np.array([])
+        total_weight = sum(weights.values())
+        if total_weight <= 0:
+            first_key = list(factors.keys())[0]
+            return np.zeros_like(factors[first_key])
         first_key = list(factors.keys())[0]
         result = np.zeros_like(factors[first_key])
-        total_weight = sum(weights.values())
         for name, values in factors.items():
             w = weights.get(name, 0)
             result += values * w / total_weight
@@ -353,7 +383,10 @@ class FactorOperator:
             return FactorOperator.composite(factors, "equal_weight")
 
         elif method == "max_ic":
-            # 选取 IC 最高的因子
+            # 选取 IC 最高的因子（当前为占位实现，返回第一个因子；
+            # 完整实现需要传入 IC 权重进行排序）
+            # TODO: 实现 max_ic 选项 — 当前返回第一个因子，需要改为按 IC 排序
+            logger.warning("max_ic composite method not fully implemented, returning first factor")
             return list(factors.values())[0]
 
         else:
@@ -455,9 +488,14 @@ def backtest_factor(
         n = len(ic_series)
         if n > 1 and result.ic_std > 0:
             result.t_statistic = result.ic_mean / (result.ic_std / np.sqrt(n))
-            # 近似 p-value (双尾)
-            from math import erf
-            result.p_value = float(1 - erf(abs(result.t_statistic) / np.sqrt(2)))
+            # 使用 t 分布计算双尾 p-value；如果 scipy 不可用则回退到正态近似
+            try:
+                import scipy.stats as _st
+                result.p_value = float(2 * (1 - _st.t.cdf(abs(result.t_statistic), df=n - 1)))
+            except ImportError:
+                # NOTE: 使用正态分布近似，小样本时可能低估 p-value。对于 n < 30 建议使用 t 分布。
+                from math import erf
+                result.p_value = float(1 - erf(abs(result.t_statistic) / np.sqrt(2)))
             result.is_significant = result.p_value < 0.05
 
     # ---- 2. 分位数收益 ----
@@ -489,12 +527,13 @@ def backtest_factor(
             result.autocorrelation.append(0.0)
 
     # 半衰期: 自相关降到 0.5 以下的滞后阶数
-    for i, ac in enumerate(result.autocorrelation):
-        if ac < 0.5:
-            result.decay_half_life = i + 1
-            break
-    if result.decay_half_life == 0 and result.autocorrelation:
-        result.decay_half_life = len(result.autocorrelation)
+    if len(result.autocorrelation) > 0:
+        for i, ac in enumerate(result.autocorrelation):
+            if ac < 0.5:
+                result.decay_half_life = i + 1
+                break
+        if result.decay_half_life == 0:
+            result.decay_half_life = len(result.autocorrelation)
 
     # ---- 4. 综合评分 ----
     result.composite_score = _compute_factor_score(result)
@@ -628,6 +667,64 @@ class CausalHysteresisRegime:
 
         return self.state.current_regime
 
+    def update_single_pair(
+        self,
+        returns: np.ndarray,
+        symbol: Optional[str] = None,
+    ) -> MarketRegime:
+        """单品种直接更新 — 统一接口，对齐 EnhancedRegimeDetector。
+
+        修复 Bug 38: 统一两个体制分类器的接口，
+        让调用方可以无差别替换使用。底层仍走 update() 三参数接口。
+
+        Args:
+            returns: 该品种收益率序列 (1H 频率)
+            symbol: 可选币种名（用于诊断日志）
+
+        Returns:
+            当前体制
+        """
+        if returns is None or len(returns) < 8:
+            return self.state.current_regime
+
+        # 计算 1H 与 4H 收益率趋势符号
+        # 4H 收益率 = 1H 收益率的 4 步累计
+        if len(returns) < 4:
+            return self.state.current_regime
+        ret_1h = float(np.sum(returns[-1:]))
+        ret_4h = float(np.sum(returns[-4:]))
+        trend_1h_sign = 1.0 if ret_1h > 0 else (-1.0 if ret_1h < 0 else 0.0)
+        trend_4h_sign = 1.0 if ret_4h > 0 else (-1.0 if ret_4h < 0 else 0.0)
+
+        # 修复 Bug C-3: 计算 1H 与 4H 收益率的交叉相关性（而非自相关）
+        # 4H 收益率 = 1H 收益率的 4 步滚动累计
+        if len(returns) < 8:
+            corr = 0.0
+        else:
+            ret_1h_aligned = returns[3:]  # 对齐：从第4根开始
+            ret_4h_rolling = np.array([float(np.sum(returns[i:i+4]))
+                                       for i in range(len(returns) - 3)])
+            std_1h = np.std(ret_1h_aligned)
+            std_4h = np.std(ret_4h_rolling)
+            if std_1h > 0 and std_4h > 0:
+                corr = float(np.corrcoef(ret_1h_aligned, ret_4h_rolling)[0, 1])
+            else:
+                corr = 0.0
+
+        regime = self.update(
+            correlation=corr,
+            trend_1h_sign=trend_1h_sign,
+            trend_4h_sign=trend_4h_sign,
+        )
+
+        if symbol:
+            logger.debug(
+                f"[{symbol}] 1H ret={ret_1h:.4f}, 4H ret={ret_4h:.4f}, "
+                f"corr={corr:.3f}, regime={regime.value}"
+            )
+
+        return regime
+
     def _classify_regime(
         self,
         correlation: float,
@@ -699,6 +796,14 @@ class CausalHysteresisRegime:
                 reverse=True,
             )[:5],
         }
+
+
+# 修复 2026-08-07: 优先使用增强版体制检测器 (regime_detector.EnhancedRegimeDetector
+# 子类, Schmitt-trigger)。旧版实现 (上方 class CausalHysteresisRegime) 不支持
+# regime_enter_threshold/exit_threshold/corr_window/smooth_window 配置参数 —
+# agent/coin_tracker 从 alpha_zoo 导入时自动获得增强版, 且 update() 接口完全兼容。
+if _REGIME_ENHANCED:
+    CausalHysteresisRegime = EnhancedCausalHysteresisRegime
 
 
 # ===========================================================================
@@ -819,6 +924,8 @@ class EnhancedMemoryLifecycle:
         for tier in [self.tier1_hot, self.tier2_warm, self.tier3_cold]:
             for entry in tier.values():
                 self._apply_decay(entry)
+        # H-8: 清理已完全衰减的条目
+        self._cleanup_expired()
 
     def _apply_decay(self, entry: LifecycleEntry):
         """对单个条目应用 Ebbinghaus 衰减。
@@ -827,13 +934,23 @@ class EnhancedMemoryLifecycle:
           R = e^(-t / S)
           其中 S = 半衰期 * 重要性因子
         """
-        elapsed_days = (time.time() - entry.last_accessed) / 86400.0
+        if entry.last_accessed == 0.0:
+            elapsed_days = max(0, (time.time() - entry.created_at) / 86400.0)
+        else:
+            elapsed_days = (time.time() - entry.last_accessed) / 86400.0
         if elapsed_days > 0:
             # 重要性越高，衰减越慢
             effective_half_life = self.half_life_days * (0.5 + entry.importance)
             entry.decay_factor = math.exp(
                 -math.log(2) * elapsed_days / effective_half_life
             )
+
+    def _cleanup_expired(self):
+        """H-8: 清理已完全衰减的条目，防止内存泄漏。"""
+        for tier in [self.tier1_hot, self.tier2_warm, self.tier3_cold]:
+            expired = [k for k, v in tier.items() if v.decay_factor <= 0.001]
+            for k in expired:
+                del tier[k]
 
     def update_quality(self, key: str, was_correct: bool, learning_rate: float = 0.1):
         """根据验证结果更新质量评分。"""
@@ -859,7 +976,7 @@ class EnhancedMemoryLifecycle:
                 if score < self.archive_threshold:
                     to_remove.append(key)
             for key in to_remove:
-                del tier[key]
+                tier.pop(key, None)
                 removed += 1
 
         return removed
@@ -874,7 +991,7 @@ class EnhancedMemoryLifecycle:
                 if score < self.gc_threshold:
                     to_remove.append(key)
             for key in to_remove:
-                del tier[key]
+                tier.pop(key, None)
                 removed += 1
 
         return removed
@@ -989,7 +1106,8 @@ class FactorAnalyzer:
                 if valid.sum() > 2:
                     corr = abs(np.corrcoef(fv[valid], ev[valid])[0, 1])
                     if corr < 1.0:
-                        vif = 1.0 / (1.0 - corr ** 2)
+                        vif = 1.0 / max(1.0 - corr ** 2, 1e-10)
+                        vif = min(vif, 100.0)  # 上限截断，防止接近奇异时 VIF 爆炸
                         max_vif = max(max_vif, vif)
 
         return max_vif
@@ -1030,10 +1148,12 @@ class FactorAnalyzer:
         n_splits: int = 3,
     ) -> float:
         """子样本稳健性检验。"""
-        if len(factor_values) < n_splits * 10:
+        if len(factor_values) < n_splits * 10 or len(forward_returns) < n_splits * 10:
             return 0.0
 
         split_size = len(factor_values) // n_splits
+        if split_size < 1:
+            return 0.0
         ic_means = []
 
         for i in range(n_splits):

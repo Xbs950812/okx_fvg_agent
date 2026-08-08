@@ -12,12 +12,13 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Tuple
 
-from okx_client import OKXClient
+from okx_client import OKXClient, OKXQueryError
 from strategy import Signal
 
 
@@ -33,42 +34,125 @@ class AgentState:
     """Agent 运行状态，持久化到 JSON 文件。"""
     initial_equity: float = 0.0          # 本轮初始权益
     highest_equity: float = 0.0          # 本轮最高权益
-    total_pnl: float = 0.0               # 累计盈亏
+    total_pnl: float = 0.0               # 累计盈亏（含未实现盈亏，用于展示和回撤计算）
+    realized_pnl: float = 0.0            # 累计已实现盈亏（仅平仓时更新，用于风控和统计）
     last_equity: float = 0.0             # 上一轮权益（用于计算轮间已实现盈亏）
     positions_opened: int = 0            # 本轮已开仓数
     positions_closed: int = 0            # 本轮已平仓数
     winning_trades: int = 0              # 盈利笔数
     losing_trades: int = 0               # 亏损笔数
+    break_even_trades: int = 0           # 保本平仓笔数（pnl == 0）
     last_withdrawal_equity: float = 0.0  # 上次提现时的权益
     withdrawal_count: int = 0            # 提现次数
-    daily_loss: float = 0.0              # 当日累计已实现亏损
+    daily_loss: float = 0.0              # 当日累计亏损（ equity - daily_start_equity，≤0）
     daily_date: str = ""                 # 当日日期 (YYYY-MM-DD)
-    active_signals: Dict[str, dict] = field(default_factory=dict)  # 活跃信号 {ord_id: signal_info}
+    daily_start_equity: float = 0.0      # 当日开盘权益（用于计算实际日内盈亏）
+    active_signals: Dict[str, dict] = field(default_factory=dict)  # 活跃信号 {inst_id: position_info}
+    _pending_close: Optional[dict] = None  # 非阻塞平仓待确认状态 {inst_id, ord_id, ...}
+    pending_close_meta: Optional[dict] = None  # 修复 P0-D: _pending_close 的可序列化元数据，
+    # 持久化平仓确认所需的全部字段（不含 Signal/MasterAnalysis 等瞬态对象）。
+    # 重启后据此重建 _pending_close，续跑平仓确认 → 已实现盈亏/日亏限额不丢。
+    trailing_stop_state: Dict[str, float] = field(default_factory=dict)  # 追踪止损高水位线持久化 {inst_id: highest_price}
+    recent_pnl: List[float] = field(default_factory=list)  # 近 N 笔已实现盈亏(期望值门禁用, 2026-08-07)
+    ev_degrade_until: float = 0.0  # 期望值降频冷却截止时间戳(负期望时降频而非硬暂停, 2026-08-07)
 
 
 class StateManager:
-    """状态持久化管理器。"""
+    """状态持久化管理器。
+
+    修复: 添加 threading.Lock 防止多线程并发写入 JSON 文件损坏，
+    使用原子写入（先写临时文件再 rename）确保写入过程不产生半截文件。
+    """
 
     def __init__(self, state_path: str):
         self.state_path = state_path
+        self._lock = threading.Lock()
         self.state = self._load()
+
+    def lock(self):
+        """返回线程锁上下文管理器，供外部安全地修改 active_signals。
+
+        修复 M-1: 提供公开接口替代直接访问 _lock 私有属性。
+        """
+        return self._lock
 
     def _load(self) -> AgentState:
         if os.path.exists(self.state_path):
             try:
                 with open(self.state_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return AgentState(**data)
+                # 清理 transient 字段：_pending_close 不应跨会话持久化
+                # （其含 Signal/MasterAnalysis 等不可序列化对象）
+                data.pop("_pending_close", None)
+                state = AgentState(**data)
+                # 修复 P0-D: 从持久化的可序列化元数据重建平仓确认状态，
+                # 重启后续跑确认 → 已实现盈亏/日亏限额不丢
+                if state.pending_close_meta:
+                    state._pending_close = dict(state.pending_close_meta)
+                return state
             except Exception as e:
-                logger.warning(f"Failed to load state: {e}, starting fresh")
+                logger.warning(f"Failed to load state: {e}, trying backup...")
+                # 修复: 主文件损坏时尝试从 .bak 备份恢复
+                bak_path = self.state_path + ".bak"
+                if os.path.exists(bak_path):
+                    try:
+                        with open(bak_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        data.pop("_pending_close", None)
+                        logger.warning(f"从备份文件 {bak_path} 恢复状态成功")
+                        # 恢复后立即写回主文件
+                        state = AgentState(**data)
+                        # 修复 P0-D: 备份恢复同样重建平仓确认元数据
+                        if state.pending_close_meta:
+                            state._pending_close = dict(state.pending_close_meta)
+                        self.state = state
+                        self._write_atomic(data)
+                        return state
+                    except Exception as e2:
+                        logger.warning(f"备份文件也损坏: {e2}, starting fresh")
         return AgentState()
 
-    def save(self):
+    def _write_atomic(self, data: dict):
+        """原子写入 + 备份保护。先写临时文件 → fsync → rename → 更新备份。"""
+        tmp_path = self.state_path + ".tmp"
+        bak_path = self.state_path + ".bak"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            # 同步写入磁盘，防止 OS 缓存导致断电丢失
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.state_path)
+        # 写入成功后更新备份（在主文件原子替换之后）
         try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(self.state.__dict__, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+            with open(bak_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass  # 备份失败不影响主文件
+
+    def save(self):
+        with self._lock:
+            try:
+                data = dict(self.state.__dict__)
+                # 修复 P0-D: _pending_close 含 Signal/MasterAnalysis/Candle 等
+                # 不可序列化对象，不能整体持久化（此前导致写入失败）。现在拆出
+                # 可序列化元数据持久化（供重启续跑平仓确认 → 已实现盈亏与
+                # 日亏限额不丢），瞬态对象本身仅存内存。
+                _pc = self.state._pending_close
+                if _pc:
+                    data["pending_close_meta"] = {
+                        k: v for k, v in _pc.items()
+                        if k not in ("best_signal", "best_analysis", "best_coin",
+                                     "best_regime", "best_funding_rate", "candles_4h")
+                    }
+                else:
+                    data.pop("pending_close_meta", None)
+                data.pop("_pending_close", None)
+                self._write_atomic(data)
+            except Exception as e:
+                logger.error(f"Failed to save state: {e}")
+                # 修复: 写入失败时记录警告但不崩溃，保留旧文件不变
 
     def update_equity(self, equity: float):
         """更新权益追踪。"""
@@ -80,12 +164,24 @@ class StateManager:
             self.state.highest_equity = equity
         self.state.total_pnl = equity - self.state.initial_equity
 
-    def reset_daily_if_new_day(self):
-        """跨日重置当日亏损。"""
-        today = datetime.now().strftime("%Y-%m-%d")
+    def reset_daily_if_new_day(self, equity: float = 0.0):
+        """跨日重置当日亏损，记录当日开盘权益。
+
+        Args:
+            equity: 当前权益，用于作为当日开盘权益基准。
+        """
+        # 修复: 使用 UTC 时间对齐交易所日线结算基准 (UTC 00:00)
+        # 加密货币 7x24h 交易，本地时区 (如 UTC+8) 会导致日切点与交易所不一致
+        # 在极端单边行情中，本地时区的"一天"可能跨两次交易所结算，导致日亏损限额被重置两次
+        # 修复: datetime.utcnow() 在 Python 3.12+ 已弃用，改用 datetime.now(timezone.utc)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if today != self.state.daily_date:
             self.state.daily_loss = 0.0
             self.state.daily_date = today
+            self.state.daily_start_equity = equity
+        elif self.state.daily_start_equity <= 0 and equity > 0:
+            # 首次运行或旧状态文件无此字段时补设
+            self.state.daily_start_equity = equity
 
     def check_withdrawal(self, equity: float, withdrawal_pct: float) -> bool:
         """检查是否触发提现条件。
@@ -100,14 +196,57 @@ class StateManager:
         return equity >= self.state.last_withdrawal_equity * (1.0 + withdrawal_pct / 100.0)
 
     def record_withdrawal(self, equity: float, withdrawal_pct: float = 25.0):
-        """记录提现事件。"""
+        """记录提现建议事件。
+
+        修复: 不再在本地状态中虚拟扣除资金。
+        脚本不具备 API 资金划转权限，强行修改本地权益计数器
+        会导致下一轮拉取的真实权益与本地记录脱节，扰乱 Kelly/自适应杠杆计算。
+        仅记录提现提醒次数和最后提醒权益，不修改任何资金数字。
+        """
         self.state.last_withdrawal_equity = equity
         self.state.withdrawal_count += 1
         self.save()
         withdraw_amount = equity * withdrawal_pct / 100.0
-        logger.info(f"=== 提现提醒 #{self.state.withdrawal_count} === "
-                    f"当前权益: {equity:.2f} USDT, "
-                    f"建议提现: {withdraw_amount:.2f} USDT ({withdrawal_pct:.0f}%)")
+        logger.warning(
+            f"=== 提现提醒 #{self.state.withdrawal_count} === "
+            f"当前权益: {equity:.2f} USDT, "
+            f"建议提现: {withdraw_amount:.2f} USDT ({withdrawal_pct:.0f}%) "
+            f"—— 请手动通过 OKX App/Web 执行资金划转"
+        )
+
+    def record_realized_pnl(self, pnl: float):
+        """记录已实现盈亏（平仓时调用），同步更新 daily_loss 和 realized_pnl。
+
+        Args:
+            pnl: 本次平仓的实现盈亏（USDT），可为负
+        """
+        # 修复 C3+H6: daily_loss 改为追踪实际累计已实现 PnL（不再被未实现盈亏覆盖）
+        # 原先: 盈利时 min(0, daily_loss + pnl) 导致 profit+loss 序列后 daily_loss 显示亏损
+        # 现在: 直接累加，正负均可，最终检查 daily_loss 是否低于 -max_daily_loss
+        self.state.daily_loss += pnl
+        self.state.realized_pnl += pnl
+        # 滚动已实现盈亏列表(期望值门禁用): 保留最近 100 笔
+        self.state.recent_pnl.append(pnl)
+        if len(self.state.recent_pnl) > 100:
+            self.state.recent_pnl = self.state.recent_pnl[-100:]
+        if pnl < 0:
+            self.state.losing_trades += 1
+        elif pnl > 0:
+            self.state.winning_trades += 1
+        else:
+            self.state.break_even_trades += 1
+        self.state.positions_closed += 1
+
+    def get_win_rate(self) -> float:
+        """计算胜率（剔除保本交易，避免失真）。
+
+        Returns:
+            胜率 (0-1)，无交易时返回 0
+        """
+        decisive = self.state.winning_trades + self.state.losing_trades
+        if decisive <= 0:
+            return 0.0
+        return self.state.winning_trades / decisive
 
 
 # ---------------------------------------------------------------------------
@@ -121,59 +260,91 @@ def calculate_position_size(
     risk_pct: float,
     leverage: int,
     margin_pct: float,
+    direction: str = "long",
     contract_value: float = 1.0,
     min_sz: float = 1.0,
     sz_precision: int = 0,
+    sizing: str = "risk",
+    enforce_risk_cap: bool = False,
 ) -> Tuple[float, float]:
     """计算仓位大小。
 
-    公式推导：
-      risk_amount = equity * risk_pct / 100
-      stop_distance_pct = |entry_price - stop_loss| / entry_price
-      position_value = risk_amount / stop_distance_pct
-      margin = position_value / leverage
-      sz = position_value / (entry_price * contract_value)
+    两种仓位模式 (由 config risk.position_sizing 控制, 纸面/实盘统一口径):
+      - "risk" (默认): 风险倒推 — 单笔风险金额固定 (equity×risk_pct%)，
+        止损越近仓位越大。公式:
+            risk_amount = equity * risk_pct / 100
+            stop_distance_pct = |entry_price - stop_loss| / entry_price
+            position_value = risk_amount / stop_distance_pct
+            margin = position_value / leverage
+            sz = position_value / (entry_price * contract_value)
+      - "margin" (满仓模拟): 保证金驱动 — 用满 margin_pct% 权益做保证金，
+        名义仓位 = 保证金 × 杠杆 (模拟真实满杠杆交易)。公式:
+            margin = equity * margin_pct / 100
+            position_value = margin * leverage
+            sz = position_value / (entry_price * contract_value)
 
     Args:
         equity: 账户权益
         entry_price: 入场价
         stop_loss: 止损价
-        risk_pct: 单笔风险比例 (1.0 = 1%)
+        risk_pct: 单笔风险比例 (1.0 = 1%)，仅 "risk" 模式使用
         leverage: 杠杆倍数
         margin_pct: 最大保证金比例 (30 = 30%)
+        direction: 持仓方向 "long" | "short"
         contract_value: 每张合约面值 (USDT 本位默认为 1)
         min_sz: 最小下单量
         sz_precision: 数量精度（小数位数）
+        sizing: 仓位模式 "risk" | "margin"
 
     Returns:
         (sz, margin_used) 合约张数和占用保证金
     """
-    if equity <= 0 or entry_price <= 0:
+    if equity <= 0 or entry_price <= 0 or stop_loss <= 0:
+        return 0.0, 0.0
+    # 方向校验：long 的止损必须低于入场价，short 的止损必须高于入场价
+    if direction == "long" and stop_loss >= entry_price:
+        return 0.0, 0.0
+    if direction == "short" and stop_loss <= entry_price:
         return 0.0, 0.0
 
-    risk_amount = equity * risk_pct / 100.0
     stop_distance_pct = abs(entry_price - stop_loss) / entry_price
-
     if stop_distance_pct < 1e-10:
         return 0.0, 0.0
 
-    # 仓位价值 = 风险金额 / 止损距离
-    position_value = risk_amount / stop_distance_pct
-
-    # 保证金 = 仓位价值 / 杠杆
-    margin = position_value / leverage
-
-    # 保证金上限检查
-    max_margin = equity * margin_pct / 100.0
-    if margin > max_margin:
-        margin = max_margin
+    if sizing == "margin":
+        # 保证金驱动 (满仓模拟): 用满 margin_pct% 权益做保证金，名义 = 保证金 × 杠杆
+        margin = equity * margin_pct / 100.0
+        if margin <= 0:
+            return 0.0, 0.0
+        # 以损定量硬上限(2026-08-07 调研): 单笔风险(保证金×止损距离%)不得超过
+        # 权益×risk_pct%(社区铁律单笔风险≤1-2%)。实测 ACT SL 6.96%×9U=2.1% 超 1%,
+        # margin 模式若不禁则绕过 risk_per_trade_pct 风控。
+        if enforce_risk_cap and risk_pct > 0:
+            max_margin_by_risk = equity * risk_pct / 100.0 / stop_distance_pct
+            if margin > max_margin_by_risk:
+                logger.debug(
+                    f"Margin capped by risk cap: {margin:.2f} → {max_margin_by_risk:.2f} "
+                    f"(risk={risk_pct}%, stop={stop_distance_pct:.2%})")
+                margin = max_margin_by_risk
         position_value = margin * leverage
-        logger.debug(f"Position capped by margin limit: "
-                     f"margin={margin:.2f} (max={max_margin:.2f})")
+    else:
+        # 风险倒推 (默认, 风控优先)
+        risk_amount = equity * risk_pct / 100.0
+        # 仓位价值 = 风险金额 / 止损距离
+        position_value = risk_amount / stop_distance_pct
+        # 保证金 = 仓位价值 / 杠杆
+        margin = position_value / leverage
+        # 保证金上限检查
+        max_margin = equity * margin_pct / 100.0
+        if margin > max_margin:
+            margin = max_margin
+            position_value = margin * leverage
+            logger.debug(f"Position capped by margin limit: "
+                         f"margin={margin:.2f} (max={max_margin:.2f})")
 
     # 合约张数
     sz = position_value / (entry_price * contract_value)
-    sz = round(sz, sz_precision)
+    sz = math.floor(sz * (10 ** sz_precision)) / (10 ** sz_precision)
 
     if sz < min_sz:
         logger.debug(f"Position size {sz} < min {min_sz}, skipping")
@@ -207,22 +378,69 @@ def execute_signal(
     """
     risk_cfg = config["risk"]
 
+    # 单笔杠杆硬上限(2026-08-07 调研): 10万以下账户单笔≤5x + ADL自动减仓按
+    # 杠杆盈亏%排序(满杠杆=ADL顺位最前, 极端行情高杠杆盈利仓被强制平)。
+    # max_position_leverage=0 时不限制(兼容旧配置)。
+    _eff_leverage = int(signal.leverage or 1)
+    _lev_cap = int(risk_cfg.get("max_position_leverage", 0) or 0)
+    if _lev_cap > 0 and _eff_leverage > _lev_cap:
+        logger.info(
+            f"[LeverageCap] {signal.inst_id} 杠杆 {_eff_leverage}x → "
+            f"{_lev_cap}x (单笔杠杆上限, ADL/爆仓风险)")
+        _eff_leverage = _lev_cap
+
+    # ---- P0-A 修复: 止损距离 vs 爆仓距离 硬校验 ----
+    # 此前全系统无强平价计算，高杠杆窄止损在跳空下会先爆仓后止损
+    # （代码注释自认"强平引擎会比止损单先到"）。
+    # 逐仓 isolated 近似: 强平距离 ≈ 1/杠杆 − 维持保证金率(MMR)（未含手续费，
+    # 取安全侧余量）。MMR 从 position-tiers 档位获取，失败用保守默认 0.5%。
+    # 硬校验: |entry − SL| < 强平距离 × 安全系数，否则拒单/降杠杆。
+    _mmr = float(risk_cfg.get("default_mmr", 0.005) or 0.005)
+    try:
+        _tiers = client.get_position_tiers(signal.inst_id)
+        if _tiers:
+            _t_mmr = float(_tiers.get("mmr", 0) or 0)
+            if _t_mmr > 0:
+                _mmr = _t_mmr
+    except Exception:
+        pass
+    _liq_dist = 1.0 / max(_eff_leverage, 1) - _mmr
+    _entry_px = float(signal.entry_price or 0)
+    _sl_px = float(signal.stop_loss or 0)
+    _stop_dist = (abs(_entry_px - _sl_px) / _entry_px) if _entry_px > 0 else 1.0
+    _safety = float(risk_cfg.get("liq_safety_factor", 0.5) or 0.5)
+    if _liq_dist <= 0 or _stop_dist >= _liq_dist * _safety:
+        logger.error(
+            f"[LiqCheck] {signal.inst_id} 拒单(fail-closed): 止损距离 "
+            f"{_stop_dist:.2%} >= 爆仓距离 {_liq_dist:.2%} × 安全系数 "
+            f"{_safety:.0%} (杠杆 {_eff_leverage}x, MMR {_mmr:.3%})。"
+            f"降杠杆或放弃该信号。"
+        )
+        return None
+    logger.debug(
+        f"[LiqCheck] {signal.inst_id} 通过: 止损距离 {_stop_dist:.2%} "
+        f"< 爆仓距离 {_liq_dist:.2%} × {_safety:.0%} (杠杆 {_eff_leverage}x)"
+    )
+
     # ---- 确定合约参数 ----
     # USDT 本位永续合约面值因币种而异，默认 0.01（如 BTC ctVal=0.01）
     # 当 instrument_info 获取失败时，用 0.01 比 1.0 更安全
     ct_val = 0.01
-    min_sz = 1.0
-    sz_precision = 0
-
     if instrument_info:
         ct_val = float(instrument_info.get("ctVal", "0.01"))
-        min_sz = float(instrument_info.get("minSz", "1"))
-        # 从 lotSz 推断精度
-        lot_sz = instrument_info.get("lotSz", "1")
-        if "." in lot_sz:
-            sz_precision = len(lot_sz.split(".")[1])
-        else:
-            sz_precision = 0
+    else:
+        # 修复 H8: instrument_info 为 None 时无法获取合约面值，跳过交易
+        # 默认 ct_val=0.01 仅 BTC 正确，altcoin 会严重超估仓位
+        logger.error(f"Cannot get instrument info for {signal.inst_id}, aborting signal")
+        return None
+
+    min_sz = float(instrument_info.get("minSz", "1"))
+    # 从 lotSz 推断精度
+    lot_sz = instrument_info.get("lotSz", "1")
+    if "." in lot_sz:
+        sz_precision = len(lot_sz.split(".")[1])
+    else:
+        sz_precision = 0
 
     # ---- 计算仓位 ----
     sz, margin = calculate_position_size(
@@ -230,16 +448,34 @@ def execute_signal(
         entry_price=signal.entry_price,
         stop_loss=signal.stop_loss,
         risk_pct=risk_cfg["risk_per_trade_pct"],
-        leverage=signal.leverage,
+        leverage=_eff_leverage,
         margin_pct=risk_cfg["margin_pct"],
+        direction=signal.position_side,
         contract_value=ct_val,
         min_sz=min_sz,
         sz_precision=sz_precision,
+        sizing=risk_cfg.get("position_sizing", "risk"),
+        enforce_risk_cap=risk_cfg.get("enforce_risk_cap", True),
     )
 
     if sz <= 0:
         logger.warning(f"Calculated sz=0 for {signal.inst_id}, skip")
         return None
+
+    # 修复 P2-5: 按 lotSz 整数倍对齐（floor）。此前仅按小数位截断，
+    # 对 lotSz 非 10 的负幂的币种（如 lotSz=10/3）可能被 OKX 拒单，
+    # 且拒单不报错仅 warning → 漏执行。
+    try:
+        lot_float = float(lot_sz)
+        if lot_float > 0:
+            sz = math.floor(sz / lot_float) * lot_float
+            if sz < min_sz:
+                logger.warning(
+                    f"Aligned sz={sz} < min {min_sz} for {signal.inst_id}, skip"
+                )
+                return None
+    except (TypeError, ValueError):
+        pass
 
     # ---- 确定 side 和 posSide ----
     if signal.position_side == "long":
@@ -275,16 +511,30 @@ def execute_signal(
 
     # ---- 设置杠杆 ----
     # OKX 合约交易必须先设置杠杆，否则使用默认 1x
+    # 修复 P1-1: 必须用封顶后的 _eff_leverage —— 此前仓位计算用封顶值、
+    # set_leverage 用未封顶原始值，导致账户真实杠杆高于风控假设
+    # （强平价更近 + ADL 顺位更前），max_position_leverage 形同虚设。
     leverage_ok = client.set_leverage(
         inst_id=signal.inst_id,
-        lever=signal.leverage,
+        lever=_eff_leverage,
         mgn_mode=risk_cfg["margin_mode"],
+        pos_side=pos_side,  # 修复: 双向持仓模式下必须传入 posSide
     )
     if not leverage_ok:
-        logger.warning(f"Failed to set leverage for {signal.inst_id}, "
-                       f"using default (may cause margin mismatch)")
+        logger.error(f"Cannot set leverage for {signal.inst_id}, aborting signal")
+        return None
 
     # ---- 下单 ----
+    # 原则: 不追涨杀跌 — 只限价挂单等待 FVG 回补价位成交，绝不转市价追单。
+    # 限价单创建失败（如价格保护/网络）则放弃本轮，等待下一轮信号。
+    _sl_slippage = 0.005  # 0.5% 最大滑点
+    _sl_val = signal.stop_loss  # 浮点止损价
+    if pos_side == "long":
+        sl_px_safe = f"{_sl_val * (1 - _sl_slippage):.{px_precision}f}"
+    else:
+        sl_px_safe = f"{_sl_val * (1 + _sl_slippage):.{px_precision}f}"
+
+    # 限价单：只在 FVG 理想入场价挂单，等待回补成交
     ord_id = client.place_order(
         inst_id=signal.inst_id,
         side=side,
@@ -293,11 +543,33 @@ def execute_signal(
         px=entry_px,
         ord_type="limit",
         td_mode=risk_cfg["margin_mode"],
-        tp_trigger=tp_px,
-        tp_price="-1",      # 市价止盈
-        sl_trigger=sl_px,
-        sl_price="-1",      # 市价止损
     )
+    if not ord_id:
+        logger.warning(
+            f"[Limit] {signal.inst_id} 限价单创建失败，放弃本轮（不追市价）"
+        )
+        return None
+
+    # 主单成功后独立挂止盈止损（限价单未成交时挂单可能失败，
+    # 交由后续轮次的 trailing 逻辑补挂）
+    algo_id = client.place_algo_order(
+        inst_id=signal.inst_id,
+        td_mode=risk_cfg["margin_mode"],
+        side="sell" if pos_side == "long" else "buy",
+        pos_side=pos_side,
+        sz=sz_str,
+        ord_type="conditional",
+        tp_trigger_px=tp_px,
+        tp_ord_px="-1",
+        sl_trigger_px=sl_px,
+        sl_ord_px=sl_px_safe,
+        reduce_only=True,
+    )
+    if not algo_id:
+        logger.warning(
+            f"[Algo] {signal.inst_id} 止盈止损单未挂上（限价主单可能未成交），"
+            f"将由后续监控补挂；主单 ord_id={ord_id}"
+        )
 
     return ord_id
 
@@ -322,6 +594,11 @@ def monitor_positions(
         {inst_id: position_info}
     """
     positions = client.get_positions()
+    # 修复 P0-B (fail-closed): get_positions 返回 None（查询失败）时抛异常，
+    # 由主循环捕获后跳过本轮。绝不能把"API 故障"当"无持仓"——否则
+    # active_count 误判 0、风控放行、已满仓时超限开仓。
+    if positions is None:
+        raise OKXQueryError("get_positions failed (fail-closed)")
     risk_cfg = config["risk"]
     result = {}
 
@@ -338,13 +615,17 @@ def monitor_positions(
 
         result[inst_id] = {
             "pos_side": pos_side,
-            "size": pos_sz,
+            # 修复 P1-4: size 归一化为 abs()。OKX 文档约定 isolated 下 pos 恒正、
+            # 方向看 posSide；但 cross 模式下空头 pos 为负。全链路统一 abs，
+            # 杜绝 `size > 0` 判空头永远为假 → 空头被风控忽略/裸奔。
+            "size": abs(pos_sz),
             "avg_px": avg_px,
             "mark_px": mark_px,
             "upl": upl,
             "upl_ratio_pct": upl_ratio * 100,
             "margin": margin,
             "leverage": lever,
+            "c_time": int(pos.get("cTime", "0")) / 1000.0 if pos.get("cTime") else 0.0,
         }
 
         if abs(pos_sz) > 0:
@@ -358,40 +639,49 @@ def monitor_positions(
     # 获取当前权益
     equity = client.get_total_equity() or 0.0
 
-    # 检查平仓变动，更新胜率统计
+    # 检查平仓变动
     prev_active = len(state_manager.state.active_signals)
     current_active = len([p for p in positions if abs(float(p.get("pos", "0"))) > 0])
 
-    if prev_active > 0 and current_active < prev_active:
-        # 有仓位平掉了，通过权益变化近似判断
-        closed_count = prev_active - current_active
-        if equity and state_manager.state.last_equity > 0:
-            pnl_change = equity - state_manager.state.last_equity
-            if pnl_change > 0:
-                state_manager.state.winning_trades += closed_count
-            elif pnl_change < 0:
-                state_manager.state.losing_trades += closed_count
-        state_manager.state.positions_closed += closed_count
+    # 修复 H5: 同步 active_signals 与交易所实际持仓
+    # 清理已在交易所不存在的失效信号条目
+    exchange_pos_ids = {p.get("instId", "") for p in positions if abs(float(p.get("pos", "0"))) > 0}
+    stale_keys = []
+    for key, sig in list(state_manager.state.active_signals.items()):
+        inst_id = sig.get("inst_id") or sig.get("instId", "")
+        if inst_id not in exchange_pos_ids:
+            stale_keys.append(key)
+            logger.warning(f"[Sync] 清理失效信号: {inst_id} (key={key})，交易所已无此持仓")
+    for key in stale_keys:
+        del state_manager.state.active_signals[key]
 
-    state_manager.state.active_signals = {
-        p.get("instId", ""): p for p in positions
-        if abs(float(p.get("pos", "0"))) > 0
-    }
-
-    # 每日亏损检查 — 使用已实现亏损（权益变化），而非未实现盈亏
-    # 仅在权益下降时累加亏损
-    if equity and state_manager.state.last_equity > 0:
-        realized_pnl = equity - state_manager.state.last_equity
-        if realized_pnl < 0:
-            state_manager.state.daily_loss += realized_pnl
+    # active_signals: {inst_id: position_info} — indexed by instrument ID, not order ID
+    # 修复: 存储 normalized 格式（result 中的字段名），而非原始 OKX API 响应
+    # 原始响应用 instId/pos/avgPx 等驼峰命名，而读取方期望 inst_id/size/avg_px 等下划线命名
+    # 不一致导致 .get("inst_id") 返回 None，stale key 清理逻辑静默失效
+    # 修复 QE-1: 合并保留自定义字段（如 signal_id / confidence / master_score 等），
+    # 避免完整覆盖导致 SignalPerformanceTracker 无法关联持仓与信号。
+    with state_manager._lock:
+        new_active: Dict[str, dict] = {}
+        for inst_id, info in result.items():
+            if info.get("size", 0) <= 0:
+                continue
+            prev = state_manager.state.active_signals.get(inst_id, {})
+            merged = dict(prev)
+            merged.update(info)
+            merged["inst_id"] = inst_id
+            new_active[inst_id] = merged
+        state_manager.state.active_signals = new_active
 
     state_manager.state.last_equity = equity
 
-    max_daily_loss = equity * risk_cfg["max_daily_loss_pct"] / 100.0 if equity else 0
-    if abs(state_manager.state.daily_loss) >= max_daily_loss and max_daily_loss > 0:
+    # 修复 H7: 使用 daily_start_equity 作为基准（与 risk_gate 一致）
+    max_daily_loss = state_manager.state.daily_start_equity * risk_cfg["max_daily_loss_pct"] / 100.0 if state_manager.state.daily_start_equity else 0
+    # 修复 C3+H6: daily_loss 现在追踪累计已实现 PnL，检查是否低于负阈值
+    if state_manager.state.daily_loss <= -max_daily_loss and max_daily_loss > 0:
         logger.warning(
             f"!!! DAILY LOSS LIMIT REACHED !!! "
-            f"Loss: {state_manager.state.daily_loss:.2f} >= {max_daily_loss:.2f}"
+            f"累计已实现 PnL: {state_manager.state.daily_loss:.2f} <= -{max_daily_loss:.2f}"
         )
 
     return result
@@ -405,32 +695,84 @@ def manage_pending_orders(
     client: OKXClient,
     current_price: float,
     signal: Optional[Signal] = None,
-    stale_minutes: int = 60,
-) -> int:
+    stale_minutes: int = 30,
+    limit_order_timeout_minutes: int = 15,  # 修复 P0-1: 限价单短超时，防止永远不成交
+) -> Tuple[int, bool]:
     """管理挂单：取消过期订单，避免重复下单。
 
     Args:
         client: OKX 客户端
         current_price: 当前市场价格（用于价格偏离检测）
         signal: 如果有新信号，检查是否已存在相同方向的挂单
-        stale_minutes: 超过此时间的挂单视为过期
+        stale_minutes: 超过此时间的挂单视为过期（通用）
+        limit_order_timeout_minutes: 限价单超时时间（比 stale_minutes 更短，防止错过行情）
 
     Returns:
-        取消的订单数
+        (cancelled_count, should_skip_signal) — should_skip_signal=True 表示应跳过新信号
     """
     orders = client.get_pending_orders()
+    # 修复 P0-B: 挂单查询失败返回 None 时，本轮不做挂单管理
+    # （不撤单、不判冲突），避免把"查询失败"当"无挂单"而重复挂单。
+    if orders is None:
+        logger.warning("get_pending_orders failed (fail-closed)，本轮跳过挂单管理")
+        return 0, False
     cancelled = 0
+    should_skip = False
     now = time.time() * 1000  # ms
+
+    def _cancel_orphan_protection(inst_id: str) -> int:
+        """撤销该币种失效的保护单（oco/conditional）。
+
+        场景: OKX 允许在无持仓时挂 reduceOnly 保护单，因此开仓限价单
+        尚未成交时保护单已挂上。若限价单超时被撤且该币种无持仓，
+        保护单会成为孤儿单残留交易所（此前 FLOW/SATS 残留的根因）。
+        仅在该币种无持仓时联动撤销，避免误撤真实持仓的保护。
+        """
+        _n = 0
+        try:
+            _has_pos = any(
+                float(p.get("pos", 0)) != 0
+                for p in client.get_positions(inst_id=inst_id)
+            )
+        except Exception:
+            _has_pos = True  # 查询失败时保守处理：不撤保护单
+        if _has_pos:
+            return 0
+        for _ot in ("oco", "conditional"):
+            try:
+                for _a in client.get_algo_orders(
+                    inst_id=inst_id, inst_type="SWAP", ord_type=_ot
+                ):
+                    if _a.get("state") in ("live", "effective"):
+                        _aid = _a.get("algoId", "")
+                        if client.cancel_algo_order(_aid, inst_id):
+                            _n += 1
+                            logger.info(f"[Pending] 联动撤销孤儿保护单 {_aid} ({inst_id})")
+            except Exception as e:
+                logger.debug(f"[Pending] 查询保护单失败 {inst_id}: {e}")
+        return _n
 
     for order in orders:
         ord_id = order.get("ordId", "")
         inst_id = order.get("instId", "")
         pos_side = order.get("posSide", "")
+        ord_type = order.get("ordType", "")
         px = float(order.get("px", "0"))
         create_time = int(order.get("cTime", "0"))
 
-        # 检查是否过期
         age_minutes = (now - create_time) / 60000.0 if create_time > 0 else 0
+
+        # 修复 P0-1: 限价单短超时 — 价格不回踩就取消，改追价或放弃
+        # 顶级交易员做法: 挂单 N 根 K 线不成交 → 撤单，不等 60 分钟
+        if ord_type == "limit" and age_minutes > limit_order_timeout_minutes:
+            logger.info(f"Cancelling stale limit order {ord_id} ({inst_id}, age={age_minutes:.0f}m > {limit_order_timeout_minutes}m)")
+            if client.cancel_order(inst_id, ord_id):
+                cancelled += 1
+                # 修复: 联动撤销孤儿保护单，防止 algo 单残留交易所
+                cancelled += _cancel_orphan_protection(inst_id)
+            continue
+
+        # 检查是否过期
         if age_minutes > stale_minutes:
             logger.info(f"Cancelling stale order {ord_id} ({inst_id}, age={age_minutes:.0f}m)")
             if client.cancel_order(inst_id, ord_id):
@@ -440,7 +782,8 @@ def manage_pending_orders(
         # 如果有新信号，检查冲突
         if signal and inst_id == signal.inst_id and pos_side == signal.position_side:
             logger.info(f"Similar pending order exists for {inst_id}, skip new signal")
-            return cancelled
+            should_skip = True
+            continue
 
         # 如果价格远离挂单价超过阈值，取消
         if px > 0 and current_price > 0:
@@ -450,8 +793,10 @@ def manage_pending_orders(
                             f"deviation={deviation*100:.2f}%)")
                 if client.cancel_order(inst_id, ord_id):
                     cancelled += 1
+                    # 修复: 联动撤销孤儿保护单，防止 algo 单残留交易所
+                    cancelled += _cancel_orphan_protection(inst_id)
 
-    return cancelled
+    return cancelled, should_skip
 
 
 # ---------------------------------------------------------------------------
@@ -516,16 +861,26 @@ def print_summary(state: AgentState, equity: float):
     if state.initial_equity <= 0:
         return
 
-    total_pnl_pct = (equity - state.initial_equity) / state.initial_equity * 100
-    total_trades = state.winning_trades + state.losing_trades
-    win_rate = state.winning_trades / total_trades * 100 if total_trades > 0 else 0
+    # 修复 Bug 49: print_summary 使用 break_even 单独统计，
+    # 胜率分母剔除保本交易，避免失真
+    # 修复：微小初始权益时百分比溢出 — 初始权益 < 1 USDT 时不显示百分比
+    if state.initial_equity >= 1.0:
+        total_pnl_pct = (equity - state.initial_equity) / state.initial_equity * 100
+        pnl_pct_str = f" ({total_pnl_pct:+.2f}%)"
+    else:
+        pnl_pct_str = ""
+    decisive_trades = state.winning_trades + state.losing_trades
+    all_trades = decisive_trades + state.break_even_trades
+    win_rate = state.winning_trades / decisive_trades * 100 \
+        if decisive_trades > 0 else 0
 
     logger.info(
         f"\n{'='*50}\n"
         f"  SUMMARY\n"
         f"  Equity:     {equity:.2f} USDT\n"
-        f"  PnL:        {equity - state.initial_equity:+.2f} ({total_pnl_pct:+.2f}%)\n"
-        f"  Trades:     {total_trades} (W:{state.winning_trades} L:{state.losing_trades})\n"
+        f"  PnL:        {equity - state.initial_equity:+.2f}{pnl_pct_str}\n"
+        f"  Trades:     {all_trades} "
+        f"(W:{state.winning_trades} L:{state.losing_trades} BE:{state.break_even_trades})\n"
         f"  Win Rate:   {win_rate:.1f}%\n"
         f"  Withdrawals:{state.withdrawal_count}\n"
         f"{'='*50}"

@@ -28,9 +28,19 @@ from multi_channel import (
     full_multi_channel_analysis,
 )
 from executor import calculate_spread, get_tradable_coins
+from alpha_zoo import CausalHysteresisRegime
 
 
 logger = logging.getLogger(__name__)
+
+
+# OKX K 线 bar 参数映射（标准格式，无需 utc 后缀）
+BAR_MAP = {
+    "1m": "1m", "3m": "3m", "5m": "5m",
+    "15m": "15m", "30m": "30m",
+    "1H": "1H", "4H": "4H",
+    "1D": "1D", "1W": "1W",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +135,9 @@ class CoinResearchCache:
                 return self._entries[inst_id]
             entry = CoinResearchEntry(inst_id=inst_id)
             self._entries[inst_id] = entry
+            # LRU 淘汰
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
             return entry
 
     def needs_candle_refresh(self, inst_id: str) -> bool:
@@ -146,6 +159,11 @@ class CoinResearchCache:
         with self._lock:
             return list(self._entries.values())
 
+    def remove(self, inst_id: str):
+        """移除缓存条目（线程安全）。"""
+        with self._lock:
+            self._entries.pop(inst_id, None)
+
     def get_fresh_signals(self, min_confidence: float = 0.40,
                           min_agreement: float = 0.50) -> List[Tuple[CoinResearchEntry, dict]]:
         """获取所有新鲜且满足置信度要求的信号条目。
@@ -162,7 +180,8 @@ class CoinResearchCache:
                 if not entry.has_analysis or entry.analysis is None:
                     continue
                 a = entry.analysis
-                if (a.final_confidence < min_confidence or
+                confidence = a.final_confidence
+                if (confidence < min_confidence or
                         a.channel_agreement < min_agreement):
                     continue
                 coin_info = {
@@ -172,10 +191,16 @@ class CoinResearchCache:
                     "bidPx": entry.bid_px,
                     "askPx": entry.ask_px,
                 }
-                results.append((entry, coin_info))
-            # 按置信度降序
-            results.sort(key=lambda x: x[0].analysis.final_confidence, reverse=True)
-            return results
+                results.append((entry, coin_info, confidence))
+            # 按置信度降序（锁内排序，使用存储的置信度值）
+            # 注：全量排序在缓存 < 200 条目时开销可接受，若缓存膨胀需改用 heapq
+            if len(self._entries) > self.max_entries * 2.5:
+                logger.warning(
+                    "缓存条目已达 %d，超过 %d 阈值，建议调高 max_entries 或改用 heapq 优化排序",
+                    len(self._entries), self.max_entries * 2.5,
+                )
+            results.sort(key=lambda x: x[2], reverse=True)
+            return [(entry, coin_info) for entry, coin_info, _ in results]
 
     def stats(self) -> Dict[str, Any]:
         """获取缓存统计信息。"""
@@ -197,6 +222,132 @@ class CoinResearchCache:
 # ---------------------------------------------------------------------------
 # 后台追踪线程
 # ---------------------------------------------------------------------------
+
+def _perform_coin_research(
+    client,
+    config: dict,
+    inst_id: str,
+    current_price: float,
+    candles_by_tf: Dict[str, List[Candle]],
+    signals: List[Signal],
+    mc_cfg: dict,
+    debate_cfg: dict,
+    expert_engine,
+    regime_detector,
+    debate_engine,
+) -> Tuple[Optional[MasterAnalysis], str]:
+    """提取共享的研究逻辑：多通道分析 → 体制检测 → 辩论。
+
+    Args:
+        client: OKXClient 实例
+        config: 完整配置
+        inst_id: 币种 ID
+        current_price: 当前价格
+        candles_by_tf: 各周期 K 线
+        signals: FVG 信号列表
+        mc_cfg: 多通道配置
+        debate_cfg: 辩论引擎配置
+        expert_engine: MasterTraderEngine 实例
+        regime_detector: 体制检测器实例
+        debate_engine: 辩论引擎实例
+
+    Returns:
+        (analysis, detected_regime) — analysis 可能为 None
+    """
+    analysis = None
+    detected_regime = "NEUTRAL"
+
+    candles_1h = candles_by_tf.get("1H", [])
+    candles_4h = candles_by_tf.get("4H", [])
+
+    # 多通道分析
+    if mc_cfg.get("enabled", True) and expert_engine:
+        analysis = full_multi_channel_analysis(
+            client=client,
+            inst_id=inst_id,
+            current_price=current_price,
+            candles_1h=candles_1h,
+            candles_4h=candles_4h,
+            fvg_signals=signals,
+            config=config,
+            engine=expert_engine,
+        )
+
+        # 体制检测
+        if regime_detector and len(candles_1h) >= 20 and len(candles_4h) >= 20:
+            # 修复: K 线数据空洞检测 — 冷门币种可能缺少某些小时的 K 线
+            # 如果时间戳不连续，直接用切片做 1H→4H 聚合会产生时序错乱
+            # M-21: 检查所有加载的 K 线时间戳连续性，而非仅最后 20 根
+            _ts_ok = True
+            if len(candles_1h) > 2:
+                _ts_diffs = [candles_1h[i].timestamp - candles_1h[i - 1].timestamp
+                             for i in range(1, len(candles_1h))]
+                _median_diff = np.median(_ts_diffs)
+                _max_gap = max(_ts_diffs)
+                if _median_diff > 0 and _max_gap > _median_diff * 1.5:
+                    _ts_ok = False
+                    logger.warning(f"K-line gap detected for {inst_id}: "
+                                   f"max_gap={_max_gap}, median={_median_diff}")
+
+            if _ts_ok:
+                ret_1h = [math.log(candles_1h[i].close / candles_1h[i - 1].close)
+                          for i in range(1, len(candles_1h))]
+                ret_4h = [math.log(candles_4h[i].close / candles_4h[i - 1].close)
+                          for i in range(1, len(candles_4h))]
+                trend_1h_sign = float(np.sign(np.mean(ret_1h))) if ret_1h else 0.0
+                trend_4h_sign = float(np.sign(np.mean(ret_4h))) if ret_4h else 0.0
+                # 修复 CT-1: 计算 1H 与 4H 收益率的跨时间尺度互相关
+                # 行业标准做法 (Vibe-Trading, Freqtrade): 将高频数据聚合到低频，
+                # 确保两序列覆盖相同时间范围后再计算 Pearson 相关系数
+                corr = 0.0
+                if len(ret_1h) > 5 and len(ret_4h) > 2:
+                    try:
+                        # 1H→4H 聚合: 每 4 根 1H 对数收益率求和 = 1 根 4H 等效收益率
+                        n_align = min(len(ret_4h), len(ret_1h) // 4)
+                        if n_align >= 3:
+                            r4 = np.array(ret_4h[-n_align:])
+                            r1_agg = np.array([
+                                sum(ret_1h[-(i + 1) * 4: -i * 4] if i > 0
+                                    else ret_1h[-4:])
+                                for i in range(n_align)
+                            ][::-1])
+                            corr = float(np.corrcoef(r1_agg, r4)[0, 1])
+                            if np.isnan(corr):
+                                corr = 0.0
+                    except Exception:
+                        corr = 0.0
+                regime_state = regime_detector.update(
+                    correlation=corr,
+                    trend_1h_sign=trend_1h_sign,
+                    trend_4h_sign=trend_4h_sign,
+                )
+                detected_regime = regime_state.value
+            else:
+                # 有空洞，保留上一轮 regime 不变
+                if regime_detector and hasattr(regime_detector, 'state'):
+                    detected_regime = regime_detector.state.current_regime.value
+
+        # 辩论
+        if debate_cfg.get("enabled", True) and debate_engine:
+            debate_result = debate_engine.conduct_debate(
+                symbol=inst_id,
+                channel_reports=analysis.channels,
+                fvg_signals=signals,
+                current_price=current_price,
+                regime=detected_regime,
+            )
+            if debate_result.winner == "tie":
+                analysis.final_confidence *= 0.9
+            elif debate_result.winner == "bullish" and analysis.final_score > 0:
+                analysis.final_confidence *= 1.1
+            elif debate_result.winner == "bearish" and analysis.final_score < 0:
+                analysis.final_confidence *= 1.1
+            elif debate_result.winner in ("bullish", "bearish"):
+                analysis.final_confidence *= 0.85
+            analysis.final_confidence = max(0.0, min(0.95, analysis.final_confidence))
+
+    return analysis, detected_regime
+
 
 class CoinTracker(threading.Thread):
     """后台币种追踪研究线程。
@@ -226,8 +377,9 @@ class CoinTracker(threading.Thread):
         cache: CoinResearchCache,
         scan_config: Optional[dict] = None,
         expert_engine: Optional[MasterTraderEngine] = None,
-        regime_detector=None,  # CausalHysteresisRegime
+        regime_detector=None,  # CausalHysteresisRegime (原型)
         debate_engine=None,    # TradingAgentsDebateEngine
+        regime_detector_map=None,  # Dict[str, CausalHysteresisRegime] — per-symbol 共享 registry
     ):
         super().__init__(daemon=True, name="CoinTracker")
         self.client = client
@@ -237,11 +389,18 @@ class CoinTracker(threading.Thread):
         self.expert_engine = expert_engine
         self.regime_detector = regime_detector
         self.debate_engine = debate_engine
+        # 修复: 体制检测器必须是 per-symbol 实例 — 共享实例被多币种顺序调用
+        # 会互相污染状态 (candidate_count/current_regime)，一个币种触发 FUSED
+        # 后其余币种全部继承该状态，regime 永远锁死在 FUSED。
+        self._regime_detector_map = (
+            regime_detector_map if regime_detector_map is not None else {}
+        )
 
         # 控制信号
         self._pause_event = threading.Event()
-        self._pause_event.set()  # 初始为运行状态
+        self._pause_event.set()  # 初始运行状态
         self._stop_event = threading.Event()
+        self._paused_ack = threading.Event()  # 修复 H2: 线程暂停确认信号
 
         # 配置
         tracker_cfg = config.get("coin_tracker", {})
@@ -257,6 +416,42 @@ class CoinTracker(threading.Thread):
         self._total_researched: int = 0
         self._total_errors: int = 0
 
+        # 聪明钱缓存（避免每轮都查询，按 refresh_interval_cycles 轮刷新一次）
+        self._smart_money_cache: Dict[str, int] = {}
+        self._smart_money_cycle_count: int = 0
+        # 修复: 记录上次查询的周期 — get_smart_money_coins 返回空时缓存恒为空，
+        # 原逻辑 `not cache` 导致每轮都重新查询（刷屏 + 拖慢研究线程）
+        self._smart_money_last_fetch_cycle: int = 0
+
+    def get_regime_detector(self, inst_id: str):
+        """获取该币种的独立体制状态机实例。
+
+        修复: CausalHysteresisRegime 是有状态的状态机 (current_regime/
+        candidate_count/regime_duration)。原先主循环与 CoinTracker 共享
+        单个实例并逐币种调用 update()，导致状态互相污染 — 一个币种触发
+        FUSED 后其余币种全部继承 FUSED，且候选计数被多币种打断，
+        体制几乎永远无法切换。
+
+        registry 与主循环共享，保证同一币种在主循环与后台线程使用
+        同一个状态机实例。
+        """
+        if not self.regime_detector:
+            return None
+        det = self._regime_detector_map.get(inst_id)
+        if det is None:
+            proto = self.regime_detector
+            # 修复 2026-08-07: 透传全部 regime 参数 (enter/exit/corr/smooth)
+            det = CausalHysteresisRegime(
+                hysteresis_threshold=getattr(proto.state, "hysteresis_threshold", 0.15),
+                min_regime_duration=getattr(proto.state, "min_regime_duration", 5),
+                enter_threshold=getattr(proto, "enter_threshold", 0.65),
+                exit_threshold=getattr(proto, "exit_threshold", 0.45),
+                corr_window=getattr(proto, "corr_window", 60),
+                smooth_window=getattr(proto, "smooth_window", 5),
+            )
+            self._regime_detector_map[inst_id] = det
+        return det
+
     # ---- 控制接口 ----
 
     def pause(self):
@@ -269,10 +464,19 @@ class CoinTracker(threading.Thread):
         self._pause_event.set()
         logger.debug("CoinTracker resumed")
 
+    def wait_paused(self, timeout: float = 5.0) -> bool:
+        """等待后台线程实际暂停（修复 H2: 不再用 time.sleep 盲等）。"""
+        if not self._stop_event.is_set():
+            return self._paused_ack.wait(timeout=timeout)
+        return True
+
     def stop(self):
         """停止后台线程。"""
         self._stop_event.set()
         self._pause_event.set()  # 确保不卡在等待
+        self.join(timeout=5.0)
+        if self.is_alive():
+            logger.warning("CoinTracker 线程未在 5s 内停止，可能有 API 调用卡住")
 
     # ---- 线程主循环 ----
 
@@ -284,6 +488,7 @@ class CoinTracker(threading.Thread):
 
         while not self._stop_event.is_set():
             # 等待运行信号
+            self._paused_ack.set()  # 修复 H2: 确认已暂停
             self._pause_event.wait()
 
             try:
@@ -291,6 +496,8 @@ class CoinTracker(threading.Thread):
             except Exception as e:
                 logger.error(f"[CoinTracker] 研究周期异常: {e}")
                 self._total_errors += 1
+                if self._stop_event.is_set():
+                    break
                 time.sleep(5)
 
             # 短暂休眠避免 CPU 空转
@@ -300,7 +507,10 @@ class CoinTracker(threading.Thread):
                     f"(研究: {self._total_researched}, 错误: {self._total_errors})")
 
     def _research_cycle(self):
-        """单次研究周期：拉取币种列表，逐批研究。"""
+        """单次研究周期：拉取币种列表，逐批研究。
+
+        优先级: 聪明钱共识币种 > 高成交量币种。
+        """
         # ---- 刷新币种列表 ----
         now = time.time()
         if (not self._coin_list or
@@ -316,6 +526,47 @@ class CoinTracker(threading.Thread):
 
         if not self._coin_list:
             return
+
+        # ---- 聪明钱优先: 将共识币种排到队列前面（按周期缓存） ----
+        sm_cfg = self.config.get("smart_money", {})
+        priority_coins: List[dict] = []
+        if sm_cfg.get("enabled", True):
+            self._smart_money_cycle_count += 1
+            refresh_cycles = max(sm_cfg.get("refresh_interval_cycles", 3), 3)
+            # 修复: 用「距上次查询的周期」判断是否刷新 — 查询结果为空也必须
+            # 记录已查询，否则空缓存使原条件恒真，导致每轮重新查询拖慢线程
+            if (self._smart_money_cycle_count -
+                    self._smart_money_last_fetch_cycle >= refresh_cycles):
+                try:
+                    smart_coins = self.client.get_smart_money_coins(
+                        top_n_traders=sm_cfg.get("top_n_traders", 20),
+                        min_traders_holding=sm_cfg.get("min_traders_holding", 2),
+                    )
+                    if smart_coins:
+                        self._smart_money_cache = smart_coins
+                    # 无论结果是否为空，都记录本次查询周期，避免高频重查
+                    self._smart_money_last_fetch_cycle = self._smart_money_cycle_count
+                except Exception as e:
+                    logger.warning(f"[SmartMoney] 获取聪明钱数据失败: {e}")
+                    self._smart_money_last_fetch_cycle = self._smart_money_cycle_count
+
+            # 使用缓存的聪明钱数据排序币种队列
+            if self._smart_money_cache:
+                sm_set = set(self._smart_money_cache.keys())
+                remaining: List[dict] = []
+                for c in self._coin_list:
+                    if c["instId"] in sm_set:
+                        priority_coins.append(c)
+                    else:
+                        remaining.append(c)
+                if priority_coins:
+                    logger.debug(
+                        f"[SmartMoney] {len(priority_coins)} 个聪明钱币种排入优先队列，"
+                        f"剩余 {len(remaining)} 个普通币种"
+                    )
+                    # 重建队列：聪明钱优先，普通币种在后
+                    self._coin_list = priority_coins + remaining
+                    self._research_cursor = 0
 
         # ---- 逐批研究 ----
         mc_cfg = self.config.get("multi_channel", {})
@@ -342,9 +593,12 @@ class CoinTracker(threading.Thread):
                 self._total_researched += 1
             except Exception as e:
                 logger.warning(f"[CoinTracker] 研究 {inst_id} 失败: {e}")
-                # 记录错误，但不阻塞
-                entry = self.cache.get_or_create(inst_id)
-                entry.error_count += 1
+                # 记录错误，但不阻塞（通过 put 原子写入）
+                err_entry = self.cache.get(inst_id)
+                if err_entry is None:
+                    err_entry = CoinResearchEntry(inst_id=inst_id)
+                err_entry.error_count += 1
+                self.cache.put(inst_id, err_entry)
 
         if researched_this_cycle > 0:
             stats = self.cache.stats()
@@ -358,8 +612,14 @@ class CoinTracker(threading.Thread):
     def _research_single_coin(self, coin: dict, mc_cfg: dict, debate_cfg: dict):
         """研究单个币种：拉 K 线 → FVG → 多通道 → 体制 → 辩论 → 缓存。"""
         inst_id = coin["instId"]
-        current_price = coin["last"]
-        entry = self.cache.get_or_create(inst_id)
+        current_price = coin.get("last", 0)
+        existing = self.cache.get(inst_id)
+        entry = CoinResearchEntry(inst_id=inst_id)
+
+        # 保留已有的 K 线数据（若未过期）
+        if existing and not self.cache.needs_candle_refresh(inst_id):
+            entry.candles_by_tf = existing.candles_by_tf
+            entry.candle_fetched_at = existing.candle_fetched_at
 
         # 更新基础信息
         entry.current_price = current_price
@@ -371,7 +631,10 @@ class CoinTracker(threading.Thread):
         if self.cache.needs_candle_refresh(inst_id):
             candles_by_tf: Dict[str, List[Candle]] = {}
             for tf in self.config["strategy"]["timeframes"]:
-                raw = self.client.get_candles(inst_id, bar=tf, limit=200)
+                # 修复 Bug 57: 使用增强版 K 线加载
+                raw = self.client.get_candles_enhanced(inst_id, bar=BAR_MAP.get(tf, tf), limit=200)
+                if not raw:
+                    raw = self.client.get_candles(inst_id, bar=tf, limit=200)
                 if raw:
                     candles_by_tf[tf] = candles_from_raw(raw)
             if not candles_by_tf:
@@ -400,69 +663,30 @@ class CoinTracker(threading.Thread):
         entry.signals = signals
         entry.has_signals = len(signals) > 0
 
-        # ---- 步骤 4: 多通道分析 ----
-        candles_1h = candles_by_tf.get("1H", [])
-        candles_4h = candles_by_tf.get("4H", [])
-
-        if mc_cfg.get("enabled", True) and self.expert_engine:
-            analysis = full_multi_channel_analysis(
-                client=self.client,
-                inst_id=inst_id,
-                current_price=current_price,
-                candles_1h=candles_1h,
-                candles_4h=candles_4h,
-                fvg_signals=signals,
-                config=self.config,
-                engine=self.expert_engine,
-            )
-            entry.analysis = analysis
-            entry.has_analysis = True
-
-            # ---- 步骤 5: 体制检测 ----
-            if self.regime_detector and len(candles_1h) >= 20 and len(candles_4h) >= 20:
-                ret_1h = [math.log(candles_1h[i].close / candles_1h[i-1].close)
-                          for i in range(1, len(candles_1h))]
-                ret_4h = [math.log(candles_4h[i].close / candles_4h[i-1].close)
-                          for i in range(1, len(candles_4h))]
-                trend_1h_sign = float(np.sign(np.mean(ret_1h))) if ret_1h else 0.0
-                trend_4h_sign = float(np.sign(np.mean(ret_4h))) if ret_4h else 0.0
-                min_len = min(len(ret_1h), len(ret_4h))
-                corr = 0.0
-                if min_len > 1:
-                    try:
-                        corr = float(np.corrcoef(ret_1h[:min_len], ret_4h[:min_len])[0, 1])
-                    except Exception:
-                        corr = 0.0
-                regime_state = self.regime_detector.update(
-                    correlation=corr,
-                    trend_1h_sign=trend_1h_sign,
-                    trend_4h_sign=trend_4h_sign,
-                )
-                entry.detected_regime = regime_state.value
-
-            # ---- 步骤 6: 多空辩论 ----
-            if debate_cfg.get("enabled", True) and self.debate_engine:
-                debate_result = self.debate_engine.conduct_debate(
-                    symbol=inst_id,
-                    channel_reports=analysis.channels,
-                    fvg_signals=signals,
-                    current_price=current_price,
-                    regime=entry.detected_regime,
-                )
-                # 辩论结果影响分析置信度
-                if debate_result.winner == "tie":
-                    analysis.final_confidence *= 0.8
-                elif debate_result.winner == "bullish" and analysis.final_score > 0:
-                    analysis.final_confidence *= 1.1
-                elif debate_result.winner == "bearish" and analysis.final_score < 0:
-                    analysis.final_confidence *= 1.1
-                analysis.final_confidence = min(0.95, analysis.final_confidence)
+        # ---- 步骤 4-6: 多通道分析 + 体制检测 + 辩论 (共享逻辑) ----
+        analysis, detected_regime = _perform_coin_research(
+            client=self.client,
+            config=self.config,
+            inst_id=inst_id,
+            current_price=current_price,
+            candles_by_tf=candles_by_tf,
+            signals=signals,
+            mc_cfg=mc_cfg,
+            debate_cfg=debate_cfg,
+            expert_engine=self.expert_engine,
+            regime_detector=self.get_regime_detector(inst_id),
+            debate_engine=self.debate_engine,
+        )
+        entry.analysis = analysis
+        entry.has_analysis = analysis is not None
+        entry.detected_regime = detected_regime
 
         # ---- 标记研究完成 ----
         entry.researched_at = time.time()
         entry.error_count = 0
 
-        # 存入缓存
+        # 存入缓存（先移除旧条目避免内存泄漏）
+        self.cache.remove(inst_id)
         self.cache.put(inst_id, entry)
 
         # 如果有信号，打印摘要
@@ -488,6 +712,7 @@ def warmup_research(
     expert_engine: Optional[MasterTraderEngine] = None,
     regime_detector=None,
     debate_engine=None,
+    regime_detector_map=None,
     top_n: int = 10,
 ) -> int:
     """启动时对 Top N 币种进行预热研究。
@@ -504,6 +729,7 @@ def warmup_research(
     debate_cfg = config.get("debate_engine", {})
     success = 0
     _scan_cfg = scan_config if scan_config is not None else config
+    _reg_map = regime_detector_map if regime_detector_map is not None else {}
 
     for coin in coins:
         inst_id = coin["instId"]
@@ -511,13 +737,16 @@ def warmup_research(
             # 获取 K 线
             candles_by_tf: Dict[str, List[Candle]] = {}
             for tf in config["strategy"]["timeframes"]:
-                raw = client.get_candles(inst_id, bar=tf, limit=200)
+                # 修复 Bug 61: warmup 使用增强版 K 线加载
+                raw = client.get_candles_enhanced(inst_id, bar=BAR_MAP.get(tf, tf), limit=200)
+                if not raw:
+                    raw = client.get_candles(inst_id, bar=tf, limit=200)
                 if raw:
                     candles_by_tf[tf] = candles_from_raw(raw)
             if not candles_by_tf:
                 continue
 
-            current_price = coin["last"]
+            current_price = coin.get("last", 0)
             funding_rate = client.get_funding_rate(inst_id)
             spread = calculate_spread(coin.get("bidPx", 0), coin.get("askPx", 0))
 
@@ -531,62 +760,41 @@ def warmup_research(
                 spread_pct=spread,
             )
 
-            # 多通道分析
-            analysis = None
-            if mc_cfg.get("enabled", True) and expert_engine and signals:
-                analysis = full_multi_channel_analysis(
-                    client=client,
-                    inst_id=inst_id,
-                    current_price=current_price,
-                    candles_1h=candles_by_tf.get("1H", []),
-                    candles_4h=candles_by_tf.get("4H", []),
-                    fvg_signals=signals,
-                    config=config,
-                    engine=expert_engine,
-                )
-
-            # 体制检测
-            detected_regime = "NEUTRAL"
+            # 多通道分析 + 体制检测 + 辩论 (共享逻辑)
+            # 修复: 每个币种使用独立体制状态机，避免共享实例状态串扰
+            _det = None
             if regime_detector:
-                c1h = candles_by_tf.get("1H", [])
-                c4h = candles_by_tf.get("4H", [])
-                if len(c1h) >= 20 and len(c4h) >= 20:
-                    ret_1h = [math.log(c1h[i].close / c1h[i-1].close)
-                              for i in range(1, len(c1h))]
-                    ret_4h = [math.log(c4h[i].close / c4h[i-1].close)
-                              for i in range(1, len(c4h))]
-                    trend_1h_sign = float(np.sign(np.mean(ret_1h))) if ret_1h else 0.0
-                    trend_4h_sign = float(np.sign(np.mean(ret_4h))) if ret_4h else 0.0
-                    min_len = min(len(ret_1h), len(ret_4h))
-                    corr = 0.0
-                    if min_len > 1:
-                        try:
-                            corr = float(np.corrcoef(ret_1h[:min_len], ret_4h[:min_len])[0, 1])
-                        except Exception:
-                            corr = 0.0
-                    regime_state = regime_detector.update(
-                        correlation=corr,
-                        trend_1h_sign=trend_1h_sign,
-                        trend_4h_sign=trend_4h_sign,
+                _det = _reg_map.get(inst_id)
+                if _det is None:
+                    # 修复 2026-08-07: 透传全部 regime 参数 (enter/exit/corr/smooth)
+                    _det = CausalHysteresisRegime(
+                        hysteresis_threshold=getattr(
+                            regime_detector.state, "hysteresis_threshold", 0.15),
+                        min_regime_duration=getattr(
+                            regime_detector.state, "min_regime_duration", 5),
+                        enter_threshold=getattr(
+                            regime_detector, "enter_threshold", 0.65),
+                        exit_threshold=getattr(
+                            regime_detector, "exit_threshold", 0.45),
+                        corr_window=getattr(
+                            regime_detector, "corr_window", 60),
+                        smooth_window=getattr(
+                            regime_detector, "smooth_window", 5),
                     )
-                    detected_regime = regime_state.value
-
-            # 辩论
-            if debate_cfg.get("enabled", True) and debate_engine and analysis:
-                debate_result = debate_engine.conduct_debate(
-                    symbol=inst_id,
-                    channel_reports=analysis.channels,
-                    fvg_signals=signals,
-                    current_price=current_price,
-                    regime=detected_regime,
-                )
-                if debate_result.winner == "tie":
-                    analysis.final_confidence *= 0.8
-                elif debate_result.winner == "bullish" and analysis.final_score > 0:
-                    analysis.final_confidence *= 1.1
-                elif debate_result.winner == "bearish" and analysis.final_score < 0:
-                    analysis.final_confidence *= 1.1
-                analysis.final_confidence = min(0.95, analysis.final_confidence)
+                    _reg_map[inst_id] = _det
+            analysis, detected_regime = _perform_coin_research(
+                client=client,
+                config=config,
+                inst_id=inst_id,
+                current_price=current_price,
+                candles_by_tf=candles_by_tf,
+                signals=signals,
+                mc_cfg=mc_cfg,
+                debate_cfg=debate_cfg,
+                expert_engine=expert_engine,
+                regime_detector=_det,
+                debate_engine=debate_engine,
+            )
 
             # 存入缓存
             entry = CoinResearchEntry(
@@ -606,6 +814,7 @@ def warmup_research(
                 has_signals=len(signals) > 0,
                 has_analysis=analysis is not None,
             )
+            cache.remove(inst_id)
             cache.put(inst_id, entry)
             success += 1
 
