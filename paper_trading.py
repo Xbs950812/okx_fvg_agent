@@ -103,6 +103,19 @@ _SL_SLIPPAGE = 0.005          # 止损滑点，与 executor.execute_signal 的 _
 _ATR_PERIOD = 14              # 纸面移动止损 ATR 周期，与实盘 _compute_atr_from_cache 一致
 
 
+def _candle_attr(c, key: str):
+    """兼容 dict 与 Candle 对象的 K 线字段访问。
+
+    2026-08-09 修复: 行情源 _paper_market_data 返回 Candle dataclass 对象
+    (strategy.candles_from_raw)，而 _atr14/_process_pending/_check_exit 用
+    c["high"] 字典键访问 → TypeError 被静默捕获 → ATR 恒为 0 → 移动止损
+    退化为"TP 距离 50% 才激活"的超保守阈值 (RAVE +3.4% 仍未激活 TS 实测)。
+    """
+    if isinstance(c, dict):
+        return c.get(key)
+    return getattr(c, key, None)
+
+
 def _atr14(candles: List[dict]) -> float:
     """Wilder 平滑 ATR(14) — 与实盘 ATR 计算口径一致。
 
@@ -111,9 +124,9 @@ def _atr14(candles: List[dict]) -> float:
     try:
         if not isinstance(candles, list) or len(candles) < _ATR_PERIOD + 1:
             return 0.0
-        highs = [float(c["high"]) for c in candles[-(_ATR_PERIOD + 1):]]
-        lows = [float(c["low"]) for c in candles[-(_ATR_PERIOD + 1):]]
-        closes = [float(c["close"]) for c in candles[-(_ATR_PERIOD + 1):]]
+        highs = [float(_candle_attr(c, "high")) for c in candles[-(_ATR_PERIOD + 1):]]
+        lows = [float(_candle_attr(c, "low")) for c in candles[-(_ATR_PERIOD + 1):]]
+        closes = [float(_candle_attr(c, "close")) for c in candles[-(_ATR_PERIOD + 1):]]
         trs = []
         for i in range(1, len(closes)):
             trs.append(max(highs[i] - lows[i],
@@ -373,10 +386,11 @@ class PaperTradingEngine:
             except (TypeError, ValueError):
                 mark = None
         hi = lo = None
-        if candles and isinstance(candles[-1], dict):
+        if candles:
             try:
-                hi, lo = float(candles[-1]["high"]), float(candles[-1]["low"])
-            except (TypeError, ValueError, KeyError):
+                hi, lo = (float(_candle_attr(candles[-1], "high")),
+                          float(_candle_attr(candles[-1], "low")))
+            except (TypeError, ValueError):
                 hi = lo = None
         if hi is not None or mark is not None:
             if pos.side == "long":
@@ -535,10 +549,11 @@ class PaperTradingEngine:
             mark = pos.last_mark or pos.entry_px
 
         hi = lo = None
-        if candles and isinstance(candles[-1], dict):
+        if candles:
             try:
-                hi, lo = float(candles[-1]["high"]), float(candles[-1]["low"])
-            except (TypeError, ValueError, KeyError):
+                hi, lo = (float(_candle_attr(candles[-1], "high")),
+                          float(_candle_attr(candles[-1], "low")))
+            except (TypeError, ValueError):
                 hi = lo = None
 
         # 1. 止损（含滑点）

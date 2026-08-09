@@ -231,6 +231,45 @@ def test_paper_trailing_moves_sl():
         assert pos.sl_px == old_sl, "SL 不得向不利方向放松"
 
 
+def test_paper_trailing_atr_candle_objects():
+    """纸面移动止损 (2026-08-09 回归): Candle 对象格式 K 线 ATR 必须算得出。
+
+    Bug: 行情源返回 Candle dataclass (strategy.candles_from_raw)，而 _atr14
+    用 c["high"] 字典键访问 → TypeError 被静默捕获 → ATR=0 → TS 退化为
+    "TP 距离 50% 才激活" (RAVE +3.4% 仍未激活 TS 实测)。修复后 ATR 路径
+    激活阈值 = 0.5×ATR，涨幅 +0.4 即激活。
+    """
+    from strategy import Candle
+    from paper_trading import PaperTradingEngine, _atr14
+    # Candle 对象格式必须算出 ATR
+    clist = [Candle(timestamp=i, open=100.0, high=100.5, low=100.0,
+                    close=100.3, volume=10) for i in range(20)]
+    atr = _atr14(clist)
+    assert atr > 0.0, f"Candle 对象格式必须算出 ATR, 实际 {atr}"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 1, "max_positions": 1,
+                     "max_hold_hours": 48},
+            "optimization": {"trailing_stop_activation_pct": 0.5,
+                             "trailing_stop_trail_pct": 0.03},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=98.5, tp=104.0, leverage=1)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True
+        # ATR=0.5, 激活阈值=0.25: mark=100.3 (+0.3) 即应激活
+        eng._update_trailing(pos, {"mark": 100.3, "candles": clist})
+        assert pos.extra.get("ts_activated") is True, \
+            "Candle 对象格式下 ATR 激活路径必须生效 (RAVE 回归)"
+        assert pos.sl_px > 98.5, f"SL 应上移至 ATR 追踪位, 实际 {pos.sl_px:.4f}"
+
+
 def _make_choppy_candles(n=60):
     """交替 ±1% 无趋势震荡 → ADX 低 (Wilder 方向性指标近零)。"""
     out, px = [], 100.0
