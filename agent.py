@@ -2233,7 +2233,10 @@ def _paper_market_data(
     全部失败返回 None（纸面引擎保守跳过，不误成交不误平仓）。
     """
     try:
-        raw = client.get_candles_enhanced(inst_id, "1H", 3) or []
+        # 修复(2026-08-09): 取 3 根不足以计算 ATR(14) → 纸面移动止损恒退化
+        # 为固定百分比路径 (RAVE +3.4% 未激活 TS 实测)。增至 20 根，
+        # 供 _atr14(Wilder, 需 14+1 根) 与限价回补/TP/SL 判定使用。
+        raw = client.get_candles_enhanced(inst_id, "1H", 20) or []
         candles = candles_from_raw(raw) if raw else []
         mark = None
         if ws_cache is not None:

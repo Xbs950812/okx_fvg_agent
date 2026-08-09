@@ -6,19 +6,25 @@
 
 ### 问题（挡位1测试实测）
 RAVE 持仓 +3.4% 仍未激活移动止损（ts_activated=false，SL 未收紧）。
-根因：纸面行情源 `_paper_market_data` 返回 Candle dataclass 对象
-（`strategy.candles_from_raw`），而 `_atr14`/`_process_pending`/`_check_exit`
-用 `c["high"]` 字典键访问 → TypeError 被 `except` 静默捕获 → ATR 恒为 0 →
-TS 退化为"TP 距离 50% 才激活"（+8.1%），远高于 ATR 路径的 +1.6% 阈值。
-`_process_pending`/`_check_exit` 的 hi/lo 通道同样失效（仅剩 mark 判定）。
+双重根因：
+1. 纸面行情源 `_paper_market_data` 仅取 3 根 1H K 线 → `_atr14`(需 14+1 根)
+   数据不足恒返回 0 → TS 退化为"TP 距离 50% 才激活"（+8.1%）
+2. 行情源返回 Candle dataclass 对象（`strategy.candles_from_raw`），而
+   `_atr14`/`_process_pending`/`_check_exit` 用 `c["high"]` 字典键访问 →
+   TypeError 被 `except` 静默捕获（同路径双重失效）
 
 ### 修复
-- 新增 `_candle_attr`：统一兼容 dict 与 Candle 对象的 K 线字段访问
-- `_atr14` / `_process_pending` / `_check_exit` 全部改用该辅助函数
+- `_paper_market_data` K 线数量 3 → 20：ATR(14) 需要 14+1 根，3 根导致
+  ATR 恒为 0 → TS 退化为"TP 距离 50% 才激活"（+8.1%，RAVE +3.4% 未激活）
+- 新增 `_candle_attr`：统一兼容 dict 与 Candle 对象的 K 线字段访问，
+  `_atr14` / `_process_pending` / `_check_exit` 全部改用该辅助函数
+  （行情源返回 Candle dataclass，字典键访问曾被静默捕获）
 
 ### 验证
+- 运行时诊断（RAVE 真实数据）：修复后 ATR=0.0132，mark 0.3523 时 TS 激活，
+  SL 0.3201 → 0.3424（best−0.75×ATR），追踪止损链路完整生效
 - 新增回归 `test_paper_trailing_atr_candle_objects`：Candle 对象格式下
-  ATR 必须算出且 +0.3% 即激活 TS（原退化为 +0.8% 才激活）
+  ATR 必须算出且 +0.3% 即激活 TS
 - 回归 10/10 + `tests/` 48/48 全过
 
 ## [2026-08-08] 预换仓路径门禁一致性修复（横盘币绕门禁漏洞）
