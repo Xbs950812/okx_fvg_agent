@@ -64,7 +64,9 @@ def _run_execute(inst_id, side, entry, sl, tp, leverage, client=None,
                         "margin_mode": "isolated",
                         "position_sizing": "risk",
                         "enforce_risk_cap": True,
-                        "max_position_leverage": 0}}
+                        "max_position_leverage": 0,
+                        # 旧 liq 拒单测试语义: 显式开启 fail-closed
+                        "liq_check_fail_closed": True}}
     if risk_cfg:
         _config["risk"].update(risk_cfg)
     _signal = _make_signal(inst_id=inst_id, side=side,
@@ -95,6 +97,42 @@ def test_liq_check_uses_tier_mmr():
     # 10x, MMR 1% → liq_dist = 10% - 1% = 9%; 止损 5% ≥ 9%×0.5=4.5% → 拒
     ord_id = _run_execute("MMR-SWAP", "long", 100.0, 95.0, 110.0, 10, client=client)
     assert ord_id is None, "高 MMR 档位下宽止损应被拒绝"
+
+
+def test_liq_check_full_leverage_default_allow():
+    """满倍率模式 (2026-08-09): liq_check_fail_closed 默认 false —
+    满杠杆下止损=爆仓(逐仓爆仓只损该仓保证金) 警告放行，仅杠杆非法时拒单。
+
+    用户模型: 30% 余额做保证金 × 币种最大杠杆, 剩余 70% 余额当爆仓缓冲。
+    """
+    # 50x + 3% 止损: liq_dist=1.5%, 止损 3% ≥ 1.5%×0.5 → 默认警告放行
+    client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
+    ord_id = _run_execute("FULLLEV-SWAP", "long", 100.0, 97.0, 104.0, 50,
+                          client=client, risk_cfg={"liq_check_fail_closed": False})
+    assert ord_id is not None, "满倍率默认(不fail-closed)应警告放行"
+    # 杠杆非法 (爆仓距离≤0) 时即使 fail-closed=false 也必须拒单
+    client2 = _FakeClient(tiers={"mmr": "0.005", "maxLever": "1000"})
+    # 1000x: 1/1000=0.1% - 0.5% < 0 → liq_dist<=0 拒单
+    ord_id2 = _run_execute("BADLEV-SWAP", "long", 100.0, 97.0, 104.0, 1000, client=client2)
+    assert ord_id2 is None, "杠杆非法(爆仓距离≤0)必须拒单"
+
+
+def test_resolve_full_leverage_uses_tier_max():
+    """满倍率模式 (2026-08-09): 执行杠杆 = 币种 OKX position-tiers maxLever。"""
+    from executor import resolve_full_leverage
+    # tiers 返回 maxLever=50 → 满杠杆 50x (覆盖信号建议 3x)
+    client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
+    lev = resolve_full_leverage(client, "BTC-USDT-SWAP", 3, {"max_position_leverage": 0})
+    assert lev == 50, f"应取币种最大杠杆 50x, 实际 {lev}x"
+    # tiers 获取失败 → 回退信号杠杆 (max_position_leverage=0 不封顶)
+    client_none = _FakeClient(tiers=None)
+    lev2 = resolve_full_leverage(client_none, "BTC-USDT-SWAP", 3,
+                                 {"max_position_leverage": 0})
+    assert lev2 == 3, f"tiers 失败应回退信号杠杆 3x, 实际 {lev2}x"
+    # max_position_leverage>0 时仍封顶
+    lev3 = resolve_full_leverage(client, "BTC-USDT-SWAP", 3,
+                                 {"max_position_leverage": 5})
+    assert lev3 == 5, f"配置封顶 5x 应生效, 实际 {lev3}x"
 
 
 def test_pending_close_meta_roundtrip():

@@ -95,8 +95,13 @@
     "consecutive_loss_derate": 3
   },
   "risk": {
-    "risk_per_trade_pct": 1.0,
+    "risk_per_trade_pct": 30.0,
+    "_risk_per_trade_comment": "以损定量上限 = margin_pct (30%): 单仓理论最大亏损=该仓保证金(30%余额), 剩余 70% 余额当爆仓缓冲",
     "max_leverage": 10,
+    "max_position_leverage": 0,
+    "_max_position_leverage_comment": "0=不封顶: 执行杠杆 = 该币种 OKX position-tiers maxLever(逐仓最大杠杆, 满倍率模式)",
+    "liq_check_fail_closed": false,
+    "_liq_check_fail_closed_comment": "false=满杠杆下止损距离≥爆仓距离警告放行(止损=爆仓, 只损该仓保证金); true=恢复 P0-A fail-closed 拒单",
     "margin_mode": "isolated",
     "margin_pct": 30,
     "profit_withdrawal_pct": 25,

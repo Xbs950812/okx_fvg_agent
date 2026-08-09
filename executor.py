@@ -357,6 +357,38 @@ def calculate_position_size(
 # 订单执行
 # ---------------------------------------------------------------------------
 
+def resolve_full_leverage(
+    client: OKXClient,
+    inst_id: str,
+    signal_leverage: int,
+    risk_cfg: dict,
+) -> int:
+    """按币种最大杠杆解析执行杠杆 (2026-08-09 用户要求: 满倍率不分币种)。
+
+    优先取 OKX position-tiers 档位 maxLever（该币种逐仓允许的最大杠杆），
+    再受 max_position_leverage 封顶(>0 时)；获取失败回退信号建议杠杆。
+    默认(max_position_leverage=0)时 = 币种最大杠杆。
+
+    Returns:
+        执行杠杆（≥1）
+    """
+    _cap = int(risk_cfg.get("max_position_leverage", 0) or 0)
+    try:
+        _tiers = client.get_position_tiers(inst_id)
+        if _tiers:
+            _max_lev = float(_tiers.get("maxLever", 0) or 0)
+            if _max_lev > 1:
+                _lev = int(_max_lev)
+                if _cap > 0:
+                    return max(1, min(_lev, _cap))
+                return _lev
+    except Exception:
+        pass
+    if _cap > 0:
+        return max(1, min(int(signal_leverage or 1), _cap))
+    return max(1, int(signal_leverage or 1))
+
+
 def execute_signal(
     client: OKXClient,
     signal: Signal,
@@ -378,16 +410,11 @@ def execute_signal(
     """
     risk_cfg = config["risk"]
 
-    # 单笔杠杆硬上限(2026-08-07 调研): 10万以下账户单笔≤5x + ADL自动减仓按
-    # 杠杆盈亏%排序(满杠杆=ADL顺位最前, 极端行情高杠杆盈利仓被强制平)。
-    # max_position_leverage=0 时不限制(兼容旧配置)。
-    _eff_leverage = int(signal.leverage or 1)
-    _lev_cap = int(risk_cfg.get("max_position_leverage", 0) or 0)
-    if _lev_cap > 0 and _eff_leverage > _lev_cap:
-        logger.info(
-            f"[LeverageCap] {signal.inst_id} 杠杆 {_eff_leverage}x → "
-            f"{_lev_cap}x (单笔杠杆上限, ADL/爆仓风险)")
-        _eff_leverage = _lev_cap
+    # 满倍率模式 (2026-08-09 用户要求): 执行杠杆 = 币种最大杠杆 (tiers.maxLever)，
+    # 不再受 leverage_stop_budget 反推限制。max_position_leverage=0 时不封顶。
+    # 信号层 leverage 若已由主循环 resolve_full_leverage 覆盖，此处幂等。
+    _eff_leverage = resolve_full_leverage(
+        client, signal.inst_id, int(signal.leverage or 1), risk_cfg)
 
     # ---- P0-A 修复: 止损距离 vs 爆仓距离 硬校验 ----
     # 此前全系统无强平价计算，高杠杆窄止损在跳空下会先爆仓后止损
@@ -409,18 +436,31 @@ def execute_signal(
     _sl_px = float(signal.stop_loss or 0)
     _stop_dist = (abs(_entry_px - _sl_px) / _entry_px) if _entry_px > 0 else 1.0
     _safety = float(risk_cfg.get("liq_safety_factor", 0.5) or 0.5)
-    if _liq_dist <= 0 or _stop_dist >= _liq_dist * _safety:
+    # 满倍率模式 (2026-08-09): 满杠杆下爆仓距离(1/杠杆)通常远小于 FVG 止损距离，
+    # 若保持 fail-closed 将拒掉全部信号。liq_check_fail_closed=false(默认) 时
+    # 止损=爆仓视为用户接受的逐仓模型(爆仓只损该仓保证金)，降级为警告放行；
+    # 仅杠杆异常(liq_dist<=0) 或显式配置 true 时拒单。
+    _fail_closed = bool(risk_cfg.get("liq_check_fail_closed", False))
+    if _liq_dist <= 0:
         logger.error(
-            f"[LiqCheck] {signal.inst_id} 拒单(fail-closed): 止损距离 "
-            f"{_stop_dist:.2%} >= 爆仓距离 {_liq_dist:.2%} × 安全系数 "
-            f"{_safety:.0%} (杠杆 {_eff_leverage}x, MMR {_mmr:.3%})。"
-            f"降杠杆或放弃该信号。"
-        )
+            f"[LiqCheck] {signal.inst_id} 拒单: 杠杆 {_eff_leverage}x 爆仓距离 "
+            f"{_liq_dist:.2%} 非法 (MMR {_mmr:.3%})")
         return None
-    logger.debug(
-        f"[LiqCheck] {signal.inst_id} 通过: 止损距离 {_stop_dist:.2%} "
-        f"< 爆仓距离 {_liq_dist:.2%} × {_safety:.0%} (杠杆 {_eff_leverage}x)"
-    )
+    if _stop_dist >= _liq_dist * _safety:
+        _msg = (
+            f"[LiqCheck] {signal.inst_id} 止损距离 {_stop_dist:.2%} >= "
+            f"爆仓距离 {_liq_dist:.2%} × {_safety:.0%} "
+            f"(杠杆 {_eff_leverage}x, MMR {_mmr:.3%}) — 满杠杆下止损=爆仓"
+        )
+        if _fail_closed:
+            logger.error(_msg + "，拒单(fail-closed)")
+            return None
+        logger.warning(_msg + "，警告放行(逐仓爆仓只损该仓保证金)")
+    else:
+        logger.debug(
+            f"[LiqCheck] {signal.inst_id} 通过: 止损距离 {_stop_dist:.2%} "
+            f"< 爆仓距离 {_liq_dist:.2%} × {_safety:.0%} (杠杆 {_eff_leverage}x)"
+        )
 
     # ---- 确定合约参数 ----
     # USDT 本位永续合约面值因币种而异，默认 0.01（如 BTC ctVal=0.01）

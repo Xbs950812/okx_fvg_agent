@@ -2,6 +2,34 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-09] 满倍率模式 — 30% 余额保证金 × 币种最大杠杆（用户要求）
+
+### 需求（用户原话）
+"不管钱包余额有多少，每次开仓都用 20%-30% 钱包余额，将这个（20%-30%余额）以
+满倍率（不分币种，全部满倍率）开逐仓，然后剩余的资金全部放入保证金里"
+
+### 数学模型（已与用户确认）
+- 每仓保证金 = 30% 余额（isolated 逐仓）→ 单仓爆仓最大损失 = 30% 余额
+- 执行杠杆 = 该币种 OKX position-tiers maxLever（不分币种全部满倍率）
+- 剩余 70% 余额留在账户当爆仓缓冲（逐仓爆仓不拖累其余资金）
+- 关键事实: 满杠杆下爆仓距离 = 1/杠杆（50x≈2%），止损距离通常大于爆仓距离
+  → 止损=爆仓（止损单在爆仓前不会成交），这是用户接受的模型
+
+### 实现
+- `executor.resolve_full_leverage`：执行杠杆 = tiers.maxLever，受
+  max_position_leverage(>0) 封顶，获取失败回退信号杠杆
+- `executor.execute_signal`：爆仓距离校验改为 `liq_check_fail_closed` 可配置
+  （默认 false = 止损≥爆仓距离时警告放行；杠杆非法 liq_dist≤0 始终拒单）
+- `agent.py`：信号执行前统一 resolve 满杠杆覆盖 signal.leverage，
+  保证实盘(dry-run)与纸面引擎口径一致
+- `config.json`：max_position_leverage 5→0、risk_per_trade_pct 2→30、
+  新增 liq_check_fail_closed=false
+
+### 验证
+- 新增回归 `test_liq_check_full_leverage_default_allow`（满杠杆警告放行/
+  杠杆非法拒单）、`test_resolve_full_leverage_uses_tier_max`（tiers 优先/回退/封顶）
+- 回归 12/12 + `tests/` 48/48 全过
+
 ## [2026-08-09] 纸面移动止损 ATR 静默失效修复（RAVE 实测）
 
 ### 问题（挡位1测试实测）

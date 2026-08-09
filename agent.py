@@ -61,6 +61,7 @@ from executor import (
     calculate_spread,
     print_summary,
     get_tradable_coins,
+    resolve_full_leverage,
 )
 from multi_channel import (
     MasterAnalysis,
@@ -1913,6 +1914,17 @@ def _execute_signal_with_quant_enhancements(
             return None
 
     # ---- 3. 执行下单 ----
+    # 满倍率模式 (2026-08-09 用户要求): 执行杠杆 = 币种最大杠杆 (tiers.maxLever)，
+    # 统一在执行前覆盖 signal.leverage，保证实盘(dry-run)与纸面引擎口径一致。
+    # 剩余余额全部留在账户当爆仓缓冲 (isolated 逐仓爆仓只损该仓 30% 保证金)。
+    try:
+        _exec_risk = exec_config.get("risk", {}) if isinstance(exec_config, dict) else {}
+        signal.leverage = resolve_full_leverage(
+            client, signal.inst_id, int(signal.leverage or 1), _exec_risk)
+    except Exception as _lev_e:
+        logger.warning(
+            f"[Leverage] {signal.inst_id} 满杠杆解析失败，用信号杠杆 "
+            f"{signal.leverage}x: {_lev_e}")
     ord_id = execute_signal(client, signal, equity, exec_config, instrument_info)
     if not ord_id:
         return None
