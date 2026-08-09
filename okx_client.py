@@ -1396,16 +1396,27 @@ class OKXClient:
         修复 P0-A: 强平距离计算依赖档位 MMR。档位按名义价值分档，
         取第一档（小仓位）的 mmr 即可满足开仓前校验精度需求。
 
+        修复 2026-08-09 (满倍率模式): SWAP 合约此接口必须传 instFamily
+        (如 "RLS-USDT") 或 uly，只传 instId 返回 code=50015
+        "Either parameter instFamily or uly is required"，导致
+        resolve_full_leverage 恒回退信号杠杆，满倍率模式静默失效。
+
         Returns:
             档位 dict（含 mmr, maxLever 等），失败返回 None（fail-open：
             上层用保守默认 MMR 兜底）。
         """
         try:
+            # SWAP 品种: instFamily = instId 去掉 "-SWAP" 后缀 (RLS-USDT-SWAP → RLS-USDT)
+            _inst_family = inst_id[:-5] if inst_id.endswith("-SWAP") else ""
             result = self._public.get_position_tiers(
-                instType="SWAP", tdMode=td_mode, instId=inst_id
+                instType="SWAP", tdMode=td_mode, instId=inst_id,
+                instFamily=_inst_family
             )
             if result.get("code") == "0" and result.get("data"):
                 return result["data"][0]
+            logger.debug(
+                f"get_position_tiers {inst_id} failed: code={result.get('code')} "
+                f"msg={result.get('msg')}")
             return None
         except Exception as e:
             logger.debug(f"get_position_tiers exception: {e}")
