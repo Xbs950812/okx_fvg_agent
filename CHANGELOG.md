@@ -2,6 +2,27 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] fix: 测试污染真实纸面账户 — state_file 隔离 + 落盘纵深防御
+
+### 事故（盯盘实测发现，已恢复）
+新增 `test_paper_conditional_trigger` 未传 `state_file`，而 `PaperTradingEngine`
+默认落盘到 cwd 的 `paper_state.json` → 跑 pytest 时把余额 1000 的测试账户直接覆盖了
+真实纸面账户（30 起步 / 27.19 余额 / BOME 持仓 / 7 笔历史全被抹掉），并留下 BTC
+幻影持仓（entry=100/tp=104，与测试信号同参）被重启后的 agent 加载、"平仓获利 +26"、
+还按 1000 余额开了 PUMP 50x 大仓。已停进程、按快照恢复 `paper_state.json` /
+`agent_state.json`，agent 重启继续盯盘。
+
+### 修复（两层）
+1. **测试隔离**：`test_paper_conditional_trigger` / `test_paper_update_sl_tighten_only`
+   显式使用 TemporaryDirectory 内 state_file（与同文件其他测试一致）
+2. **纵深防御**：`PaperTradingEngine.state_file` 缺失时默认 `None`（不落盘），
+   `save()`/`load()` 对 None 直接返回 — 未传 state_file 的用法永远不可能再写真实账户
+   （agent.py 生产路径始终显式传 config 的 state_file，不受影响）
+
+### 验证
+- 回归 66/66 全过；跑完测试后核对 `paper_state.json` 内容与跑前逐字节一致（无污染）
+- 已提交历史: fdfef9f(深挂升级), df8ccbc(CE 纸面同步)
+
 ## [2026-08-10] fix: CE 抬止损纸面不同步 — 纸面 PnL 与实盘口径不一致
 
 ### 问题（盯盘实测发现）

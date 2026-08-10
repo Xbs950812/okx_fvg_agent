@@ -179,7 +179,10 @@ class PaperTradingEngine:
         rcfg = config.get("risk", {}) if isinstance(config, dict) else {}
         self.initial_balance: float = float(pcfg.get("balance", 1000.0))
         self.balance: float = self.initial_balance
-        self.state_file: str = pcfg.get("state_file", "paper_state.json")
+        # 修复 2026-08-10: state_file 缺失时默认 None(不落盘) —
+        # 此前默认 "paper_state.json" 指向 cwd, 测试/误用未传 state_file 时
+        # 会把假仓位直接覆盖真实纸面账户(曾致 BTC 幻影仓污染 27.19 余额账户)。
+        self.state_file: Optional[str] = pcfg.get("state_file") or None
         self.maker_fee: float = float(pcfg.get("maker_fee", _DEFAULT_MAKER_FEE))
         self.taker_fee: float = float(pcfg.get("taker_fee", _DEFAULT_TAKER_FEE))
         self.limit_timeout_s: float = float(pcfg.get("limit_timeout_min", 15)) * 60.0
@@ -918,6 +921,8 @@ class PaperTradingEngine:
         修复 P2-7: 补 fsync（原实现无 fsync，断电可能落半截内容）。
         """
         try:
+            if not self.state_file:
+                return
             payload = {
                 "initial_balance": self.initial_balance,
                 "balance": self.balance,
@@ -940,7 +945,7 @@ class PaperTradingEngine:
         修复 P2-7/P2-8: 主文件损坏时回退 .bak；数值字段做 float 强转，
         脏数据不再静默丢仓。
         """
-        if not os.path.exists(self.state_file):
+        if not self.state_file or not os.path.exists(self.state_file):
             return
         payload = None
         try:

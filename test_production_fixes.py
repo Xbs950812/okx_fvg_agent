@@ -556,36 +556,39 @@ def test_paper_conditional_trigger():
     """纸面 conditional 触发单 (2026-08-10): 价格触及 trigger_px 前不成交,
     触发后才按普通限价单逻辑等回补成交。"""
     from paper_trading import PaperTradingEngine
-    engine = PaperTradingEngine({"paper": {"balance": 1000.0,
-                                           "limit_timeout_min": 0},
-                                 "risk": {"max_hold_hours": 48},
-                                 "optimization": {}})
-    sig = _make_signal("BTC-USDT-SWAP", "long", entry=100.0, sl=98.5, tp=104.0,
-                       leverage=10)
-    sig.entry_trigger_px = 99.0  # 触发价在现价之下 (做多需价格回落触发)
-    engine.open_position(sig,
-                         instrument_info={"ctVal": "0.01", "minSz": "1",
-                                          "lotSz": "1"},
-                         risk_cfg={"risk_per_trade_pct": 1.0, "margin_pct": 30.0,
-                                   "margin_mode": "isolated",
-                                   "position_sizing": "risk",
-                                   "enforce_risk_cap": True,
-                                   "max_position_leverage": 0},
-                         equity=1000.0)
-    pos = engine._positions["BTC-USDT-SWAP"]
-    assert pos.trigger_px == 99.0, "纸面持仓应记录触发价"
-    assert not pos.filled, "触发前不应成交"
-    # update() 需通过 market_data_fn 取行情; 用 provider 桥接 _cached_md
-    engine.set_market_data_provider(lambda inst: engine._cached_md.get(inst))
-    # mark=99.5 (> trigger 99): 未触发 → 不成交
-    engine._cached_md["BTC-USDT-SWAP"] = {"mark": 99.5, "candles": []}
-    engine.update()
-    assert not pos.filled, "mark 未触及触发价前不得成交"
-    # mark=98.9 (≤ trigger 99): 触发 → 且 ≤ entry 100 → 成交
-    engine._cached_md["BTC-USDT-SWAP"] = {"mark": 98.9, "candles": []}
-    engine.update()
-    assert pos.filled, "触发且回补到 entry 后应成交"
-    assert pos.extra.get("trigger_activated", False), "应记录触发状态"
+    with tempfile.TemporaryDirectory() as td:
+        engine = PaperTradingEngine({"paper": {"balance": 1000.0,
+                                               "limit_timeout_min": 0,
+                                               "state_file": os.path.join(
+                                                   td, "paper_state.json")},
+                                     "risk": {"max_hold_hours": 48},
+                                     "optimization": {}})
+        sig = _make_signal("BTC-USDT-SWAP", "long", entry=100.0, sl=98.5, tp=104.0,
+                           leverage=10)
+        sig.entry_trigger_px = 99.0  # 触发价在现价之下 (做多需价格回落触发)
+        engine.open_position(sig,
+                             instrument_info={"ctVal": "0.01", "minSz": "1",
+                                              "lotSz": "1"},
+                             risk_cfg={"risk_per_trade_pct": 1.0, "margin_pct": 30.0,
+                                       "margin_mode": "isolated",
+                                       "position_sizing": "risk",
+                                       "enforce_risk_cap": True,
+                                       "max_position_leverage": 0},
+                             equity=1000.0)
+        pos = engine._positions["BTC-USDT-SWAP"]
+        assert pos.trigger_px == 99.0, "纸面持仓应记录触发价"
+        assert not pos.filled, "触发前不应成交"
+        # update() 需通过 market_data_fn 取行情; 用 provider 桥接 _cached_md
+        engine.set_market_data_provider(lambda inst: engine._cached_md.get(inst))
+        # mark=99.5 (> trigger 99): 未触发 → 不成交
+        engine._cached_md["BTC-USDT-SWAP"] = {"mark": 99.5, "candles": []}
+        engine.update()
+        assert not pos.filled, "mark 未触及触发价前不得成交"
+        # mark=98.9 (≤ trigger 99): 触发 → 且 ≤ entry 100 → 成交
+        engine._cached_md["BTC-USDT-SWAP"] = {"mark": 98.9, "candles": []}
+        engine.update()
+        assert pos.filled, "触发且回补到 entry 后应成交"
+        assert pos.extra.get("trigger_activated", False), "应记录触发状态"
 
 
 def test_paper_update_sl_tighten_only():
@@ -612,7 +615,6 @@ def test_paper_update_sl_tighten_only():
         pos = eng._positions["BTC-USDT-SWAP"]
         pos.filled = True
         assert pos.sl_px == 98.5
-        # CE 抬止损到成本价 → 纸面 SL 同步上移
         eng.update_sl("BTC-USDT-SWAP", 100.0)
         assert pos.sl_px == 100.0, f"CE 抬止损应同步到纸面, 实际 {pos.sl_px}"
         # 只收紧不放松: 新 SL 低于当前 → 忽略
