@@ -1321,6 +1321,11 @@ def generate_signal(
     # 窗口处触发, 触发后才挂限价进场), 避免提前深挂空转也不错过深回补。
     # 超过该上限仍拒绝(防挂永不触发的单)。0=关闭 conditional 改用旧拒绝逻辑。
     max_conditional_distance_pct: float = 15.0,
+    # 方向-深度校验阈值% (2026-08-10 方案B): 做多挂单价低于现价 / 做空挂单价
+    # 高于现价超过该 % = 系统预期深跌/深涨(接飞刀), 与开仓方向矛盾
+    # (HTF 向上做多 vs 挂单等深跌 11.5% 自相矛盾)。先回退 FVG 回补位,
+    # 回退后仍超阈值(缺口本身在深位)则否决信号。0=关闭校验。
+    direction_depth_conflict_pct: float = 5.0,
     # 最低盈亏比: 止盈距离 < SL距离 × min_risk_reward 时，把止盈推远到
     # 该盈亏比(如 2.5 = 至少 1:2.5)，满足"止盈太少"诉求。
     min_risk_reward: float = 0.0,
@@ -1494,6 +1499,25 @@ def generate_signal(
                 _deep_entry = False
                 entry_price = max(fvg.top - fvg_width * entry_depth_pct, fvg.bottom)
 
+        # 方向-深度校验 (2026-08-10 方案B): 做多但挂单价远低于现价 = 预期深跌
+        # = 接飞刀, 与做多逻辑矛盾 (HTF 向上 vs 等深跌 11.5% 自相矛盾, NEIRO 特征)。
+        # 先回退 FVG 回补位; 回退后仍超阈值(缺口本身在深位)则否决信号。
+        if direction_depth_conflict_pct > 0 and current_price > 0:
+            _dev2 = (current_price - entry_price) / current_price * 100.0
+            if _dev2 > direction_depth_conflict_pct:
+                logger.info(
+                    f"[DepthGate] {inst_id} long 挂单价偏离现价 {_dev2:.2f}% > "
+                    f"{direction_depth_conflict_pct:.1f}% 方向矛盾(做多等深跌=接飞刀)，"
+                    f"回退 FVG 回补位")
+                _deep_entry = False
+                entry_price = max(fvg.top - fvg_width * entry_depth_pct, fvg.bottom)
+                _dev3 = (current_price - entry_price) / current_price * 100.0
+                if _dev3 > direction_depth_conflict_pct:
+                    logger.info(
+                        f"[DepthGate] {inst_id} long FVG 回补位仍偏离 {_dev3:.2f}% "
+                        f"> {direction_depth_conflict_pct:.1f}%，方向矛盾否决信号")
+                    return None
+
         # 止盈: FVG 回补目标 + 额外溢价（做多期望价格反弹超越 FVG 顶部）
         take_profit = fvg.top + fvg_width * fvg_target_pct
         # 止损: FVG 下沿外侧；挂单加深(前低下方)时原 FVG 止损可能高于
@@ -1577,6 +1601,24 @@ def generate_signal(
                     f"{_eff_entry_dist:.2f}%，回退 FVG 回补位")
                 _deep_entry = False
                 entry_price = min(fvg.bottom + fvg_width * entry_depth_pct, fvg.top)
+
+        # 方向-深度校验 (2026-08-10 方案B): 做空但挂单价远高于现价 = 预期深涨
+        # = 追高, 与做空逻辑矛盾。先回退 FVG 回补位; 仍超阈值则否决。
+        if direction_depth_conflict_pct > 0 and current_price > 0:
+            _dev2 = (entry_price - current_price) / current_price * 100.0
+            if _dev2 > direction_depth_conflict_pct:
+                logger.info(
+                    f"[DepthGate] {inst_id} short 挂单价偏离现价 {_dev2:.2f}% > "
+                    f"{direction_depth_conflict_pct:.1f}% 方向矛盾(做空等深涨=追高)，"
+                    f"回退 FVG 回补位")
+                _deep_entry = False
+                entry_price = min(fvg.bottom + fvg_width * entry_depth_pct, fvg.top)
+                _dev3 = (entry_price - current_price) / current_price * 100.0
+                if _dev3 > direction_depth_conflict_pct:
+                    logger.info(
+                        f"[DepthGate] {inst_id} short FVG 回补位仍偏离 {_dev3:.2f}% "
+                        f"> {direction_depth_conflict_pct:.1f}%，方向矛盾否决信号")
+                    return None
 
         # 止盈: FVG 回补目标 + 额外折价（做空期望价格跌破 FVG 底部）
         take_profit = fvg.bottom - fvg_width * fvg_target_pct
@@ -2014,6 +2056,9 @@ def scan_fvg_all_timeframes(
             liquidity_extension_min_pct=_liq_min,
             max_entry_distance_pct=float(strategy_cfg.get("max_entry_distance_pct", 5.0)),
             entry_distance_atr_mult=float(strategy_cfg.get("entry_distance_atr_mult", 4.0)),
+            # 方向-深度校验 (2026-08-10 方案B): 深挂接飞刀/追高拦截
+            direction_depth_conflict_pct=float(
+                strategy_cfg.get("direction_depth_conflict_pct", 5.0)),
             max_conditional_distance_pct=float(
                 strategy_cfg.get("max_conditional_distance_pct", 15.0)),
             min_risk_reward=float(strategy_cfg.get("min_risk_reward", 0.0)),

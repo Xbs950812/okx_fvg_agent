@@ -2,6 +2,32 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] feat: 方向动量一致性门 (方案A) + 深挂深度校验 (方案B)
+
+### 背景（方向判断错误复盘）
+两个实测方向错误来源：
+1. **HTF(4H) 滞后**：1H 已转跌时 4H SMA20 仍向上 → 系统逆 1H 趋势开多
+   （PUMP score=0.91 做多 @0.002855 后价格 -4.6%）
+2. **深挂方向自相矛盾**：NEIRO 做多但挂单价低于现价 11.5%（=预期深跌=接飞刀），
+   "HTF 向上做多"与"挂单等深跌"两个逻辑冲突
+
+### 修改
+- `agent.py` 新增 `_direction_momentum_gate`（方案A）：开仓方向与 1H 短期趋势
+  （SMA20 + 斜率）**明确冲突**（long 且 close<SMA 且 SMA 下行 / short 对称）时否决；
+  横盘/数据不足放行不误杀。挂在 HTF 门之后、期望值门之前
+- `strategy.py` 新增 DepthGate（方案B）：做多挂单价低于现价 / 做空挂单价高于
+  现价超过 `direction_depth_conflict_pct`(默认5%) = 预期深跌/深涨(接飞刀/追高)
+  → 回退 FVG 回补位，回退后仍超阈值则否决信号
+- `config.json` 新增 `direction_depth_conflict_pct`(5.0) 与
+  `direction_momentum_gate`(enabled=true, ma_period=20)
+- 注意: DepthGate 默认 5% 前置覆盖 conditional 触发单窗口(5-15%) —
+  需 conditional 深回补时设 direction_depth_conflict_pct=0（conditional 回归
+  测试即以此验证）
+
+### 验证
+- 新增 6 个单测（动量门 3 + DepthGate 3），回归 67/67 全过
+- 重启 agent 生效
+
 ## [2026-08-10] chore: 仓位结构审查收尾 — 死配置清理 + 杠杆审计字段 + 边界注释
 
 ### 背景（仓位结构二层问题代码审查产出）

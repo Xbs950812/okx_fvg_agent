@@ -817,6 +817,64 @@ def _htf_alignment_gate(
     return True, ""
 
 
+def _direction_momentum_gate(
+    signal: Signal,
+    candles_1h: Optional[List[Candle]],
+    config: dict,
+) -> Tuple[bool, str]:
+    """方向动量一致性门 (2026-08-10 方案A): 开仓方向与 1H 短期趋势明确冲突时否决。
+
+    背景: HTF 方向门(4H SMA20)是滞后指标 — 1H 已转跌时 4H 仍向上, 系统逆着
+    1H 短期趋势开多 (实测 PUMP score=0.91 做多 @0.002855 后价格一路跌到
+    -4.6%, 方向错的根因之一是逆 1H 趋势开仓)。
+    本门用 1H SMA(trend_ma_period) + SMA 斜率判定短期趋势:
+      做多冲突 = close < SMA 且 SMA 下行 (明确空头趋势)
+      做空冲突 = close > SMA 且 SMA 上行 (明确多头趋势)
+    仅"明确冲突"否决; 横盘(SMA 走平)/数据不足放行, 避免误杀。
+
+    Returns:
+        (ok, reason)
+    """
+    if signal is None:
+        return True, ""
+    mcfg = config.get("strategy", {}).get("direction_momentum_gate") or {}
+    if not mcfg.get("enabled", True):
+        return True, ""
+    if not candles_1h or len(candles_1h) < 10:
+        return True, ""
+    ma_period = int(mcfg.get("ma_period", 20) or 20)
+    if len(candles_1h) < ma_period + 6:
+        return True, ""
+    try:
+        closes_now = [float(c.close) for c in candles_1h[-ma_period:] if c.close > 0]
+        if len(closes_now) < ma_period:
+            return True, ""
+        sma_now = sum(closes_now) / len(closes_now)
+        # SMA 斜率: 当前 SMA vs 5 根前的 SMA (同一均线窗口两个时间点)
+        closes_prev = [float(c.close) for c in candles_1h[-(ma_period + 5):-5]
+                       if c.close > 0]
+        if len(closes_prev) < ma_period:
+            return True, ""
+        sma_prev = sum(closes_prev) / len(closes_prev)
+        last_px = float(candles_1h[-1].close or 0)
+    except (TypeError, ValueError):
+        return True, ""
+    if last_px <= 0 or sma_now <= 0 or sma_prev <= 0:
+        return True, ""
+    direction = signal.position_side
+    if direction == "long" and last_px < sma_now and sma_now < sma_prev:
+        return False, (
+            f"[MomentumGate] {signal.inst_id} 做多但 1H 短期趋势向下 "
+            f"(close {last_px:.6g} < SMA{ma_period} {sma_now:.6g}, "
+            f"SMA 下行 {sma_prev:.6g}→{sma_now:.6g})，逆 1H 趋势，拒绝")
+    if direction == "short" and last_px > sma_now and sma_now > sma_prev:
+        return False, (
+            f"[MomentumGate] {signal.inst_id} 做空但 1H 短期趋势向上 "
+            f"(close {last_px:.6g} > SMA{ma_period} {sma_now:.6g}, "
+            f"SMA 上行 {sma_prev:.6g}→{sma_now:.6g})，逆 1H 趋势，拒绝")
+    return True, ""
+
+
 def _red_flag_gate(
     signal: Signal,
     analysis: Optional[Any],
@@ -1827,6 +1885,14 @@ def _execute_signal_with_quant_enhancements(
     _htf_ok, _htf_reason = _htf_alignment_gate(signal, candles_htf, config)
     if not _htf_ok:
         logger.info(_htf_reason)
+        return None
+
+    # ---- 1.6b 方向动量一致性门 (1H 短期趋势, 2026-08-10 方案A) ----
+    # HTF(4H)滞后: 1H 已转跌时 4H 仍向上 → 逆 1H 趋势开多(实测 PUMP
+    # score=0.91 做多后 -4.6%)。方向与 1H SMA+斜率明确冲突时否决。
+    _mom_ok, _mom_reason = _direction_momentum_gate(signal, candles_1h, config)
+    if not _mom_ok:
+        logger.info(_mom_reason)
         return None
 
     # ---- 1.7 期望值门禁 (负期望暂停开仓) ----

@@ -515,7 +515,10 @@ def _make_fvg_long(top=96.0, bottom=95.0, idx=26):
                fvg_index=idx)
 
 
-def _gen_signal(current_price, atr_mult=4.0, conditional_max=15.0):
+def _gen_signal(current_price, atr_mult=4.0, conditional_max=15.0,
+                depth_conflict=0.0):
+    """生成信号 (conditional 回归测试默认关闭 DepthGate, 验证 conditional 路径独立完好;
+    生产 config 默认 direction_depth_conflict_pct=5.0 时 conditional 窗口被 DepthGate 前置覆盖)。"""
     from strategy import generate_signal
     candles = _make_volatile_candles()
     return generate_signal(
@@ -528,6 +531,7 @@ def _gen_signal(current_price, atr_mult=4.0, conditional_max=15.0):
         max_entry_distance_pct=1.5,
         entry_distance_atr_mult=atr_mult,
         max_conditional_distance_pct=conditional_max,
+        direction_depth_conflict_pct=depth_conflict,
         max_leverage=10,
     )
 
@@ -794,6 +798,160 @@ def test_paper_liquidation_gap_prefers_stop_loss():
         trade = eng._trades[-1]
         assert trade["reason"] == "stop_loss", \
             f"跳空应优先止损(更近 entry), 实际 {trade['reason']}"
+
+
+def _make_momentum_candles(direction="down", n=30, step=0.008, start=110.0):
+    """单调趋势 K 线: direction=down 每根 -step%, up 每根 +step%。"""
+    out, px = [], start
+    for i in range(n):
+        if direction == "down":
+            px = px * (1 - step)
+        else:
+            px = px * (1 + step)
+        out.append(Candle(timestamp=i, open=px * 1.005,
+                          high=px * 1.01, low=px * 0.995,
+                          close=px, volume=10))
+    return out
+
+
+def _make_range_candles(n=30, base=100.0, swing=2.0, deep_low=None,
+                        deep_idx=(24, 25)):
+    """区间震荡 K 线: ±swing% 波动; deep_low 指定某几根的低点(构造前低深挂)。"""
+    out = []
+    for i in range(n):
+        hi = base * (1 + swing / 100.0)
+        lo = base * (1 - swing / 100.0)
+        if deep_low and i in deep_idx:
+            lo = deep_low
+        out.append(Candle(timestamp=i, open=base, high=hi,
+                          low=lo, close=base, volume=10))
+    return out
+
+
+def test_direction_momentum_gate_rejects_long_in_downtrend():
+    """方向动量一致性门 (2026-08-10 方案A): 1H 短期趋势明确向下时做多被否决。
+
+    回归: HTF(4H)滞后 — 1H 已转跌时 4H 仍向上, 系统逆 1H 趋势开多
+    (PUMP score=0.91 做多后 -4.6%)。
+    """
+    from agent import _direction_momentum_gate
+    candles = _make_momentum_candles("down")   # 110 → ~86, SMA20 下行
+    cfg = {"strategy": {"direction_momentum_gate": {"enabled": True,
+                                                    "ma_period": 20}}}
+    sig = _make_signal("TREND-SWAP", "long", entry=100.0, sl=95.0, tp=110.0,
+                       leverage=10)
+    ok, reason = _direction_momentum_gate(sig, candles, cfg)
+    assert not ok, "1H 下行趋势中做多应被否决"
+    assert "MomentumGate" in reason
+    # 做空在同一下行趋势中应放行(顺 1H 趋势)
+    sig_short = _make_signal("TREND-SWAP", "short", entry=100.0, sl=105.0,
+                             tp=90.0, leverage=10)
+    ok2, _ = _direction_momentum_gate(sig_short, candles, cfg)
+    assert ok2, "下行趋势做空应与趋势一致, 放行"
+
+
+def test_direction_momentum_gate_allows_long_in_uptrend():
+    """方向动量一致性门: 1H 上行趋势做多放行, 做空被否决。"""
+    from agent import _direction_momentum_gate
+    candles = _make_momentum_candles("up", start=90.0)   # 90 → ~114, SMA20 上行
+    cfg = {"strategy": {"direction_momentum_gate": {"enabled": True,
+                                                    "ma_period": 20}}}
+    sig = _make_signal("UPTREND-SWAP", "long", entry=100.0, sl=95.0, tp=115.0,
+                       leverage=10)
+    ok, _ = _direction_momentum_gate(sig, candles, cfg)
+    assert ok, "1H 上行趋势做多应与趋势一致, 放行"
+    sig_short = _make_signal("UPTREND-SWAP", "short", entry=100.0, sl=105.0,
+                             tp=90.0, leverage=10)
+    ok2, reason2 = _direction_momentum_gate(sig_short, candles, cfg)
+    assert not ok2, "上行趋势做空应被否决"
+    assert "MomentumGate" in reason2
+
+
+def test_direction_momentum_gate_allows_when_flat():
+    """方向动量一致性门: 横盘(SMA 走平)不构成明确冲突, 放行(不误杀)。"""
+    from agent import _direction_momentum_gate
+    candles = [Candle(timestamp=i, open=100.0, high=101.0, low=99.0,
+                      close=100.0, volume=10) for i in range(30)]
+    cfg = {"strategy": {"direction_momentum_gate": {"enabled": True,
+                                                    "ma_period": 20}}}
+    sig = _make_signal("FLAT-SWAP", "long", entry=100.0, sl=95.0, tp=110.0,
+                       leverage=10)
+    ok, _ = _direction_momentum_gate(sig, candles, cfg)
+    assert ok, "横盘不构成明确方向冲突, 应放行"
+
+
+def test_depth_gate_falls_back_to_fvg_reentry():
+    """深挂深度-方向校验 (2026-08-10 方案B): 做多挂单价低于现价 >5%
+    (预期深跌=接飞刀) → 回退 FVG 回补位, 回退后不深则保留信号。
+
+    回归: NEIRO 深挂 11.5% (HTF 向上 vs 等深跌自相矛盾)。
+    """
+    from strategy import generate_signal
+    # ±2% 波动区间 → ATR%≈2%, _eff_entry_dist = max(1.5, 4×2) = 8%
+    # 前低 98 → 深挂 98×0.96 = 94.08, dev=(100-94.08)/100 = 5.92% < 8%
+    # (ATR 挂钩第一步不回退) → DepthGate 5.92% > 5% → 回退 FVG 回补位
+    candles = _make_range_candles(deep_low=98.0)
+    fvg = _make_fvg_long(top=99.0, bottom=98.5, idx=len(candles) - 2)
+    sig = generate_signal(
+        inst_id="DEPTH-SWAP", fvg=fvg, current_price=100.0,
+        candles=candles, liquidity_extension_pct=4.0,
+        liquidity_extension_min_pct=3.0,
+        max_entry_distance_pct=1.5,
+        entry_distance_atr_mult=4.0,
+        max_conditional_distance_pct=15.0,
+        direction_depth_conflict_pct=5.0,
+        swing_lookback_bars=8,
+        max_leverage=10,
+    )
+    assert sig is not None, "回退到 FVG 回补位后应保留信号"
+    # 回补位 = max(99 - 0.5×0.15, 98.5) = 98.925 (dev 1.08% < 5%)
+    assert abs(sig.entry_price - 98.925) < 0.01, \
+        f"应回退到 FVG 回补位 98.925, 实际 {sig.entry_price}"
+
+
+def test_depth_gate_rejects_when_reentry_still_deep():
+    """深挂深度校验: 回退到 FVG 回补位后仍偏离 >5% (缺口本身在深位)
+    = 深跌预期未消除 → 否决信号(不接飞刀)。"""
+    from strategy import generate_signal
+    candles = _make_range_candles(deep_low=98.0)
+    # 缺口深: top=94 bottom=93 → 回补位 max(94-0.15, 93) = 93.85
+    # dev=(100-93.85)/100 = 6.15% > 5% → 深挂回退后仍超 → 否决
+    fvg = _make_fvg_long(top=94.0, bottom=93.0, idx=len(candles) - 2)
+    sig = generate_signal(
+        inst_id="DEEP-SWAP", fvg=fvg, current_price=100.0,
+        candles=candles, liquidity_extension_pct=4.0,
+        liquidity_extension_min_pct=3.0,
+        max_entry_distance_pct=1.5,
+        entry_distance_atr_mult=4.0,
+        max_conditional_distance_pct=15.0,
+        direction_depth_conflict_pct=5.0,
+        swing_lookback_bars=8,
+        max_leverage=10,
+    )
+    assert sig is None, "FVG 回补位仍深偏离(接飞刀)应否决信号"
+
+
+def test_depth_gate_allows_normal_deep():
+    """深挂深度校验: 正常深挂(偏离 ≤5%)不受影响, 保留深挂逻辑。"""
+    from strategy import generate_signal
+    # ±1% 波动区间(前低 99, swing=1) → 深挂 99×0.96 = 95.04
+    # dev=(100-95.04)/100 = 4.96% ≤ 5% → DepthGate 不触发, 保留深挂
+    candles = _make_range_candles(swing=1.0)
+    fvg = _make_fvg_long(top=99.5, bottom=99.0, idx=len(candles) - 2)
+    sig = generate_signal(
+        inst_id="NORMAL-SWAP", fvg=fvg, current_price=100.0,
+        candles=candles, liquidity_extension_pct=4.0,
+        liquidity_extension_min_pct=3.0,
+        max_entry_distance_pct=1.5,
+        entry_distance_atr_mult=4.0,
+        max_conditional_distance_pct=15.0,
+        direction_depth_conflict_pct=5.0,
+        swing_lookback_bars=8,
+        max_leverage=10,
+    )
+    assert sig is not None, "正常深挂应保留"
+    assert abs(sig.entry_price - 95.04) < 0.01, \
+        f"正常深挂不应被改动, 实际 entry={sig.entry_price}"
 
 
 if __name__ == "__main__":
