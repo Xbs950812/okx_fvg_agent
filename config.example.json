@@ -26,7 +26,13 @@
     "max_spread_pct": 0.5,
     "max_funding_rate_abs": 0.01,
     "extreme_move_min_adx": 25,
-    "extreme_move_min_atr_pct": 2.0
+    "extreme_move_min_atr_pct": 2.0,
+    "max_entry_distance_pct": 1.5,
+    "_max_entry_distance_comment": "挂单距离上限(基础值): 实际有效阈值 = max(此值, entry_distance_atr_mult×ATR%) — 涨跌幅榜极端波动币ATR大自动放宽",
+    "entry_distance_atr_mult": 4.0,
+    "_entry_distance_atr_mult_comment": "ATR挂钩深度阈值(2026-08-10 用户要求): 有效挂单距离 = max(max_entry_distance_pct, 此倍数×ATR%)。极端波动币固定1.5%会把机会全滤掉; ATR%越大允许挂得越深。0=关闭挂钩",
+    "max_conditional_distance_pct": 15.0,
+    "_max_conditional_distance_comment": "深挂conditional触发单上限(2026-08-10 用户要求): 回补位距现价超过有效阈值但≤此上限时, 改挂OKX触发单(价格先走到距回补位一个阈值窗口处触发, 触发后才挂限价进场)。超过此上限仍拒绝。0=关闭conditional回到纯拒绝"
   },
   "multi_channel": {
     "enabled": true,

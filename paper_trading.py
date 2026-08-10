@@ -160,6 +160,8 @@ class PaperPosition:
     signal_id: str = ""
     last_mark: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
+    trigger_px: float = 0.0   # 2026-08-10: conditional 触发单触发价 (0=普通限价单);
+    # 价格触及触发价前不成交(不激活), 激活后按普通限价单逻辑等回补成交
 
 
 class PaperTradingEngine:
@@ -303,6 +305,9 @@ class PaperTradingEngine:
                 ct_val=ct_val,
                 filled=False,
                 signal_id=str(getattr(signal, "signal_id", "") or ""),
+                # 深挂 conditional 触发单 (2026-08-10): 价格先走到触发位
+                # (距回补位一个阈值窗口), 触发后才挂限价等回补成交
+                trigger_px=float(getattr(signal, "entry_trigger_px", 0) or 0),
             )
             self._positions[inst_id] = pos
             # 诊断日志: 挂单价与现价偏差（验证挂单距离限制是否生效）
@@ -316,6 +321,11 @@ class PaperTradingEngine:
                         f"(entry={pos.entry_px:.6g} mark={_mark_now:.6g})")
                 except (TypeError, ValueError):
                     pass
+            if pos.trigger_px > 0:
+                logger.info(
+                    f"[Paper] {inst_id} 深挂 conditional 触发单 "
+                    f"{signal.position_side.upper()} trigger={pos.trigger_px:.6g} "
+                    f"entry={signal.entry_price:.6g} size={sz}")
             logger.info(
                 f"[Paper] {inst_id} 纸面限价挂单 {signal.position_side.upper()} "
                 f"@{signal.entry_price:.6g} size={sz} "
@@ -392,6 +402,24 @@ class PaperTradingEngine:
                           float(_candle_attr(candles[-1], "low")))
             except (TypeError, ValueError):
                 hi = lo = None
+
+        # conditional 触发单 (2026-08-10): 价格触及 trigger_px 前不激活/不成交,
+        # 避免提前深挂空转。未触发期间不计超时(触发单等待期更长, 与实盘 algo 单一致)。
+        if pos.trigger_px > 0 and not pos.extra.get("trigger_activated", False):
+            if mark is None:
+                return  # 无实时价无法判定触发, 保持挂单
+            if pos.side == "long":
+                if mark > pos.trigger_px:
+                    return
+            else:
+                if mark < pos.trigger_px:
+                    return
+            pos.extra["trigger_activated"] = True
+            logger.info(
+                f"[Paper] {pos.inst_id} conditional 触发单已触发 "
+                f"(mark={mark:.6g} trigger={pos.trigger_px:.6g}), "
+                f"激活限价 {pos.entry_px:.6g} 等回补成交")
+
         if hi is not None or mark is not None:
             if pos.side == "long":
                 if (lo is not None and lo <= pos.entry_px) or \

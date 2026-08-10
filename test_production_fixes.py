@@ -34,6 +34,8 @@ class _FakeClient:
         self._tiers = tiers
         self.placed = 0
         self.algo_placed = 0
+        self.plan_placed = 0
+        self.plan_args = None
 
     def get_position_tiers(self, inst_id, td_mode="isolated"):
         return self._tiers
@@ -51,6 +53,12 @@ class _FakeClient:
     def place_algo_order(self, **kwargs):
         self.algo_placed += 1
         return "algo1"
+
+    def place_plan_order(self, inst_id, td_mode, side, pos_side, sz,
+                         trigger_px, ord_px, trigger_px_type="last"):
+        self.plan_placed += 1
+        self.plan_args = (inst_id, side, trigger_px, ord_px)
+        return "plan1"
 
 
 def _run_execute(inst_id, side, entry, sl, tp, leverage, client=None,
@@ -435,6 +443,149 @@ def test_switch_candidate_skips_gate_rejected():
     # 持仓中的币不参与候选
     assert _pick_switch_candidate(
         [(valid, {})], {"WIF-USDT-SWAP": {"size": 1}}) is None
+
+
+def _make_volatile_candles(n=30, move_pct=2.0, start=57.0):
+    """每根 +move_pct% 高波动趋势 → ATR%≈2-3% (测试 ATR 挂钩深度阈值用)。"""
+    out, px = [], start
+    for i in range(n):
+        px = px * (1 + move_pct / 100.0)
+        out.append(Candle(timestamp=i, open=px * 0.99,
+                          high=px * (1 + move_pct / 100.0),
+                          low=px * (1 - move_pct / 100.0),
+                          close=px, volume=10))
+    return out
+
+
+def _make_fvg_long(top=96.0, bottom=95.0, idx=26):
+    return FVG(direction="long", top=top, bottom=bottom, width_pct=1.0,
+               candle_ts=idx, timeframe="1H",
+               impulse_candle=Candle(timestamp=idx, open=95.5, high=96,
+                                     low=95, close=95.5, volume=10),
+               fvg_index=idx)
+
+
+def _gen_signal(current_price, atr_mult=4.0, conditional_max=15.0):
+    from strategy import generate_signal
+    candles = _make_volatile_candles()
+    return generate_signal(
+        inst_id="MOVER-USDT-SWAP",
+        fvg=_make_fvg_long(top=85.0, bottom=84.0, idx=len(candles) - 2),
+        current_price=current_price,
+        candles=candles,
+        liquidity_extension_pct=1.5,
+        liquidity_extension_min_pct=1.5,
+        max_entry_distance_pct=1.5,
+        entry_distance_atr_mult=atr_mult,
+        max_conditional_distance_pct=conditional_max,
+        max_leverage=10,
+    )
+
+
+def test_atr_hooked_entry_distance():
+    """ATR 挂钩深度阈值 (2026-08-10): 有效挂单距离 = max(1.5%, mult×ATR%)。
+
+    极端波动币(涨跌幅榜) ATR 大 → 阈值自动放大, 允许更深挂;
+    关闭挂钩(mult=0)时同一深挂退化为 conditional。
+    """
+    # current_price=90, 流动性猎手 entry≈85 → 偏离≈5.6%
+    # ATR≈3%×current → mult=4 有效阈值≈13% → 5.6% 在阈值内 → 正常限价(非 conditional)
+    sig = _gen_signal(90.0, atr_mult=4.0)
+    assert sig is not None, "ATR 挂钩放行的深挂不应被拒绝"
+    assert not sig.use_conditional_entry, \
+        "偏离 5.6% < ATR挂钩阈值(~13%) 应为正常限价单"
+    # 关闭挂钩(mult=0): 阈值退回 1.5% → 同一深挂超阈值 → conditional
+    sig0 = _gen_signal(90.0, atr_mult=0.0)
+    assert sig0 is not None and sig0.use_conditional_entry, \
+        "关闭挂钩后同一深挂应标记 conditional 触发单"
+
+
+def test_deep_fvg_conditional_entry():
+    """深挂 conditional 触发单 (2026-08-10 用户要求):
+    偏离 > 有效阈值但 ≤ 上限 → 标记触发单(不拒绝); > 上限 → 拒绝。"""
+    # current_price=99 → 偏离≈14% (> ATR挂钩阈值≈13%, ≤ 15% 上限)
+    sig = _gen_signal(99.0, atr_mult=4.0, conditional_max=15.0)
+    assert sig is not None, "阈值内的深挂应生成 conditional 触发单"
+    assert sig.use_conditional_entry, "深挂应标记 use_conditional_entry"
+    assert sig.entry_trigger_px > 0, "conditional 单应有触发价"
+    # 触发价介于 entry 与现价之间 (价格先回落到触发位, 触发后挂限价等回补)
+    assert sig.entry_price < sig.entry_trigger_px < 99.0, (
+        f"触发价应介于 entry={sig.entry_price:.4f} 与现价 99 之间, "
+        f"实际 trigger={sig.entry_trigger_px:.4f}")
+    # 超深: current_price=105 → 偏离≈19% > 15% 上限 → 拒绝
+    sig_deep = _gen_signal(105.0, atr_mult=4.0, conditional_max=15.0)
+    assert sig_deep is None, "超过 conditional 上限的深挂应拒绝"
+    # conditional 关闭(0)时深挂直接拒绝
+    sig_off = _gen_signal(99.0, atr_mult=4.0, conditional_max=0.0)
+    assert sig_off is None, "conditional 关闭时超阈值深挂应拒绝"
+
+
+def test_executor_conditional_uses_plan_order():
+    """execute_signal (2026-08-10): use_conditional_entry 信号走 place_plan_order
+    触发单, 而非普通限价单 place_order。"""
+    client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
+    sig = _make_signal("BTC-USDT-SWAP", "long", entry=100.0, sl=98.5, tp=104.0,
+                       leverage=10)
+    sig.use_conditional_entry = True
+    sig.entry_trigger_px = 102.0
+    _config = {"risk": {"risk_per_trade_pct": 1.0, "margin_pct": 30.0,
+                        "margin_mode": "isolated",
+                        "position_sizing": "risk",
+                        "enforce_risk_cap": True,
+                        "max_position_leverage": 0,
+                        # 生产默认: 满杠杆下止损=爆仓警告放行(逐仓模型)
+                        "liq_check_fail_closed": False}}
+    from executor import execute_signal
+    ord_id = execute_signal(client, sig, equity=1000.0, config=_config,
+                            instrument_info=client.get_instrument_info("BTC-USDT-SWAP"))
+    assert ord_id == "plan1", f"conditional 信号应返回 plan 单号, 实际 {ord_id}"
+    assert client.plan_placed == 1, "应调用 place_plan_order"
+    assert client.placed == 0, "conditional 信号不得走普通限价 place_order"
+    assert client.plan_args is not None and client.plan_args[2] == 102.0, \
+        "触发价应传给 place_plan_order"
+    # 普通信号仍走 place_order
+    sig2 = _make_signal("BTC-USDT-SWAP", "long", entry=100.0, sl=98.5, tp=104.0,
+                        leverage=10)
+    ord_id2 = execute_signal(client, sig2, equity=1000.0, config=_config,
+                             instrument_info=client.get_instrument_info("BTC-USDT-SWAP"))
+    assert client.plan_placed == 1 and client.placed == 1, \
+        "普通信号应走 place_order 而非 plan_order"
+
+
+def test_paper_conditional_trigger():
+    """纸面 conditional 触发单 (2026-08-10): 价格触及 trigger_px 前不成交,
+    触发后才按普通限价单逻辑等回补成交。"""
+    from paper_trading import PaperTradingEngine
+    engine = PaperTradingEngine({"paper": {"balance": 1000.0,
+                                           "limit_timeout_min": 0},
+                                 "risk": {"max_hold_hours": 48},
+                                 "optimization": {}})
+    sig = _make_signal("BTC-USDT-SWAP", "long", entry=100.0, sl=98.5, tp=104.0,
+                       leverage=10)
+    sig.entry_trigger_px = 99.0  # 触发价在现价之下 (做多需价格回落触发)
+    engine.open_position(sig,
+                         instrument_info={"ctVal": "0.01", "minSz": "1",
+                                          "lotSz": "1"},
+                         risk_cfg={"risk_per_trade_pct": 1.0, "margin_pct": 30.0,
+                                   "margin_mode": "isolated",
+                                   "position_sizing": "risk",
+                                   "enforce_risk_cap": True,
+                                   "max_position_leverage": 0},
+                         equity=1000.0)
+    pos = engine._positions["BTC-USDT-SWAP"]
+    assert pos.trigger_px == 99.0, "纸面持仓应记录触发价"
+    assert not pos.filled, "触发前不应成交"
+    # update() 需通过 market_data_fn 取行情; 用 provider 桥接 _cached_md
+    engine.set_market_data_provider(lambda inst: engine._cached_md.get(inst))
+    # mark=99.5 (> trigger 99): 未触发 → 不成交
+    engine._cached_md["BTC-USDT-SWAP"] = {"mark": 99.5, "candles": []}
+    engine.update()
+    assert not pos.filled, "mark 未触及触发价前不得成交"
+    # mark=98.9 (≤ trigger 99): 触发 → 且 ≤ entry 100 → 成交
+    engine._cached_md["BTC-USDT-SWAP"] = {"mark": 98.9, "candles": []}
+    engine.update()
+    assert pos.filled, "触发且回补到 entry 后应成交"
+    assert pos.extra.get("trigger_activated", False), "应记录触发状态"
 
 
 if __name__ == "__main__":

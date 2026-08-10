@@ -2,6 +2,43 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] 深挂回补位升级 — ATR 挂钩深度阈值 + conditional 触发单（用户要求）
+
+### 需求（用户原话）
+"这些极端波动币的 FVG 信号多因'挂单距现价 >1.5%'被拒（已涨 47% 后回补位太深）。
+回补位太深不是好事吗？你查查专业交易所应对这个的方式"
+
+### 结论（专业调研）
+深挂回补位对"等回补"限价策略**不是好事**——深度限价单成交时点多为价格继续反方向
+移动的时刻（逆向选择 Adverse Selection），且 FVG 回补并非必然，无流动性背书的深缺口
+多为孤立陷阱。专业做法：**不深挂限价，改用触发单**（价格先走到距回补位一个阈值窗口处
+触发，触发后再挂限价进场），并让深度阈值**挂钩 ATR**（波动大的币种允许挂得更深，
+固定 1.5% 会把极端波动币机会全滤掉）。
+
+### 实现（用户确认"两者都要"）
+1. **ATR 挂钩深度阈值**（`strategy.generate_signal`）
+   - 有效挂单距离 `_eff_entry_dist = max(max_entry_distance_pct, entry_distance_atr_mult × ATR%)`
+   - 极端波动币 ATR 大 → 阈值自动放宽；`entry_distance_atr_mult=0` 关闭挂钩
+2. **深挂 conditional 触发单**（超过有效阈值但 ≤ 上限时不再拒绝）
+   - `Signal` 新增 `use_conditional_entry` / `entry_trigger_px` 字段
+   - `okx_client.place_plan_order`：OKX 计划委托（ordType=conditional），
+     triggerPx 触发后以回补位限价进场
+   - `executor.execute_signal`：conditional 信号走 `place_plan_order`，普通信号原逻辑
+   - `paper_trading`：`PaperPosition.trigger_px` + 触发激活逻辑（未触发不计超时），
+     触发后按普通限价单等回补成交
+   - 超过 `max_conditional_distance_pct`（15%）或 conditional 关闭时仍拒绝
+3. 配置（`config.json` / `config.example.json` strategy 段）
+   - `entry_distance_atr_mult: 4.0`（ATR 挂钩倍数）
+   - `max_conditional_distance_pct: 15.0`（conditional 触发单上限，0=关闭）
+
+### 验证
+- 新增回归 4 项：`test_atr_hooked_entry_distance`（挂钩放行深挂/关闭退化为
+  conditional）、`test_deep_fvg_conditional_entry`（深挂标记 conditional/超上限拒绝/
+  conditional 关闭拒绝）、`test_executor_conditional_uses_plan_order`（conditional 走
+  plan 单/普通信号走限价单）、`test_paper_conditional_trigger`（触发前不成交/触发后
+  回补成交）
+- 回归 17/17 + `tests/` 48/48 全过
+
 ## [2026-08-09] 满倍率模式 — 30% 余额保证金 × 币种最大杠杆（用户要求）
 
 ### 需求（用户原话）

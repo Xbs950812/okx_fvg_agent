@@ -69,6 +69,9 @@ class Signal:
     confluence_score: float = 0.0   # 汇流综合得分 (0-1, ConfluenceChecker 填充)
     confluence_details: dict = field(default_factory=dict)  # 汇流确认明细
     entry_quality: str = "poor"     # 入口质量 "excellent"|"good"|"poor"
+    use_conditional_entry: bool = False   # 2026-08-10: 深挂触发单 — 价格先走到
+    # 距回补位一个阈值窗口处触发, 触发后才挂限价进场(避免提前深挂空转)
+    entry_trigger_px: float = 0.0         # conditional 触发单的触发价 (0=无)
 
 
 @dataclass
@@ -1308,6 +1311,16 @@ def generate_signal(
     # 挂单距离上限(%): 深挂(流动性猎手)入场价与现价偏离超过该阈值时，
     # 回退到 FVG 回补位，避免挂单远离现价永不成交(实测 RLS 偏离 7.2% 空转)。
     max_entry_distance_pct: float = 5.0,
+    # ATR 挂钩深度阈值 (2026-08-10 用户要求): 有效挂单距离 =
+    # max(max_entry_distance_pct, entry_distance_atr_mult × ATR%)。
+    # 涨跌幅榜极端波动币 ATR 大, 固定 1.5% 会把大波动机会全部滤掉
+    # ("找不到好行情"根因之二)。0=关闭挂钩(退化为固定阈值)。
+    entry_distance_atr_mult: float = 4.0,
+    # 深挂 conditional 触发单上限 (2026-08-10 用户要求): 挂单距现价超过有效
+    # 阈值但 ≤ 该上限时, 不拒绝 — 改挂触发单(价格先走到距回补位一个阈值
+    # 窗口处触发, 触发后才挂限价进场), 避免提前深挂空转也不错过深回补。
+    # 超过该上限仍拒绝(防挂永不触发的单)。0=关闭 conditional 改用旧拒绝逻辑。
+    max_conditional_distance_pct: float = 15.0,
     # 最低盈亏比: 止盈距离 < SL距离 × min_risk_reward 时，把止盈推远到
     # 该盈亏比(如 2.5 = 至少 1:2.5)，满足"止盈太少"诉求。
     min_risk_reward: float = 0.0,
@@ -1366,6 +1379,23 @@ def generate_signal(
         Signal 或 None（被过滤）
     """
     fvg_width = abs(fvg.top - fvg.bottom)
+
+    # ---- ATR 挂钩深度阈值 (2026-08-10 用户要求) ----
+    # 有效挂单距离 = max(max_entry_distance_pct, entry_distance_atr_mult × ATR%)。
+    # 涨跌幅榜极端波动币 ATR 大(±10%+ 波动), 固定 1.5% 硬阈值会把大波动
+    # 机会全部滤掉。ATR 数据不足时退化为固定阈值。
+    _atr_dist = _compute_atr_wilder(candles, atr_period)
+    _atr_pct = (_atr_dist / current_price * 100.0) if (_atr_dist > 0 and current_price > 0) else 0.0
+    _eff_entry_dist = max_entry_distance_pct
+    if _atr_pct > 0 and entry_distance_atr_mult > 0:
+        _eff_entry_dist = max(max_entry_distance_pct, entry_distance_atr_mult * _atr_pct)
+    if _eff_entry_dist != max_entry_distance_pct:
+        logger.debug(
+            f"[EntryLimit] {inst_id} ATR挂钩阈值: ATR={_atr_pct:.2f}% × "
+            f"{entry_distance_atr_mult:.0f} = {_eff_entry_dist:.2f}% "
+            f"(基础 {max_entry_distance_pct}%)")
+    use_conditional_entry = False   # 深挂触发单标记
+    entry_trigger_px = 0.0          # conditional 触发价
 
     # ---- 过滤器 0: FVG 新鲜度 ----
     # 修复: 旧 FVG 缺口远离现价（BEAT entry 偏离现价 148%），不仅难成交
@@ -1454,12 +1484,13 @@ def generate_signal(
                 entry_price = max(fvg.top - fvg_width * entry_depth_pct, fvg.bottom)
 
         # 挂单距离限制: 深挂偏离现价过大时回退 FVG 回补位（防远离现价空转）
-        if _deep_entry and max_entry_distance_pct > 0 and current_price > 0:
+        # 阈值随 ATR 挂钩放大 (_eff_entry_dist): 极端波动币允许更深挂
+        if _deep_entry and _eff_entry_dist > 0 and current_price > 0:
             _dev = (current_price - entry_price) / current_price * 100.0
-            if _dev > max_entry_distance_pct:
+            if _dev > _eff_entry_dist:
                 logger.info(
                     f"[EntryLimit] {inst_id} long 深挂偏离 {_dev:.2f}% > "
-                    f"{max_entry_distance_pct}%，回退 FVG 回补位")
+                    f"{_eff_entry_dist:.2f}%，回退 FVG 回补位")
                 _deep_entry = False
                 entry_price = max(fvg.top - fvg_width * entry_depth_pct, fvg.bottom)
 
@@ -1537,12 +1568,13 @@ def generate_signal(
                 entry_price = min(fvg.bottom + fvg_width * entry_depth_pct, fvg.top)
 
         # 挂单距离限制: 深挂偏离现价过大时回退 FVG 回补位（防远离现价空转）
-        if _deep_entry and max_entry_distance_pct > 0 and current_price > 0:
+        # 阈值随 ATR 挂钩放大 (_eff_entry_dist): 极端波动币允许更深挂
+        if _deep_entry and _eff_entry_dist > 0 and current_price > 0:
             _dev = (entry_price - current_price) / current_price * 100.0
-            if _dev > max_entry_distance_pct:
+            if _dev > _eff_entry_dist:
                 logger.info(
                     f"[EntryLimit] {inst_id} short 深挂偏离 {_dev:.2f}% > "
-                    f"{max_entry_distance_pct}%，回退 FVG 回补位")
+                    f"{_eff_entry_dist:.2f}%，回退 FVG 回补位")
                 _deep_entry = False
                 entry_price = min(fvg.bottom + fvg_width * entry_depth_pct, fvg.top)
 
@@ -1594,15 +1626,32 @@ def generate_signal(
     # ---- 最终挂单距离上限检查 ----
     # 深挂路径回退到 FVG 回补位后，大 FVG 的回补位本身仍可能远离现价
     # (实测 BICO 回退后仍偏离 3-19%)，同样难成交。无论哪条路径，最终
-    # 挂单价距现价超过 max_entry_distance_pct 一律否决，保证挂单贴近现价
-    # (专业限价单偏移量级 0-1.2%)。
-    if max_entry_distance_pct > 0 and current_price > 0:
+    # 挂单价距现价超过有效阈值 (_eff_entry_dist, ATR 挂钩) 时:
+    #   - 偏离 ≤ max_conditional_distance_pct → 改用 conditional 触发单
+    #     (2026-08-10 用户要求): 价格先走到距回补位一个阈值窗口处触发,
+    #     触发后才挂限价进场 — 不提前深挂空转, 也不错过深回补机会
+    #   - 偏离 > max_conditional_distance_pct → 拒绝(防挂永不触发的单)
+    if _eff_entry_dist > 0 and current_price > 0:
         _final_dev = abs(entry_price - current_price) / current_price * 100.0
-        if _final_dev > max_entry_distance_pct:
-            logger.info(
-                f"[EntryLimit] {inst_id} {position_side} 挂单距现价 "
-                f"{_final_dev:.2f}% > {max_entry_distance_pct}%，拒绝挂单")
-            return None
+        if _final_dev > _eff_entry_dist:
+            if max_conditional_distance_pct > 0 and _final_dev <= max_conditional_distance_pct:
+                use_conditional_entry = True
+                if position_side == "long":
+                    entry_trigger_px = entry_price * (1 + _eff_entry_dist / 100.0)
+                    entry_trigger_px = min(entry_trigger_px, current_price)
+                else:
+                    entry_trigger_px = entry_price * (1 - _eff_entry_dist / 100.0)
+                    entry_trigger_px = max(entry_trigger_px, current_price)
+                logger.info(
+                    f"[EntryLimit] {inst_id} {position_side} 深挂偏离 "
+                    f"{_final_dev:.2f}% > {_eff_entry_dist:.2f}%，改用 conditional "
+                    f"触发单 (trigger={entry_trigger_px:.6g} entry={entry_price:.6g})")
+            else:
+                logger.info(
+                    f"[EntryLimit] {inst_id} {position_side} 挂单距现价 "
+                    f"{_final_dev:.2f}% > 有效阈值 {_eff_entry_dist:.2f}% "
+                    f"(conditional 上限 {max_conditional_distance_pct}%)，拒绝挂单")
+                return None
 
     # ---- 止盈目标距离合理性检查（修复 MMT 巨型缺口 TP 形同虚设）----
     # 异常波动币的巨型缺口会把 TP 算到远离 entry 的不现实位置
@@ -1753,6 +1802,8 @@ def generate_signal(
         reason=f"FVG {fvg.direction} {fvg.timeframe} "
                f"width={fvg.width_pct:.2f}% "
                f"abnormal={fvg.is_abnormal} sigma={fvg.sigma:.1f}",
+        use_conditional_entry=use_conditional_entry,
+        entry_trigger_px=entry_trigger_px,
     )
 
 
@@ -1962,6 +2013,9 @@ def scan_fvg_all_timeframes(
             liquidity_extension_pct=_liq_ext,
             liquidity_extension_min_pct=_liq_min,
             max_entry_distance_pct=float(strategy_cfg.get("max_entry_distance_pct", 5.0)),
+            entry_distance_atr_mult=float(strategy_cfg.get("entry_distance_atr_mult", 4.0)),
+            max_conditional_distance_pct=float(
+                strategy_cfg.get("max_conditional_distance_pct", 15.0)),
             min_risk_reward=float(strategy_cfg.get("min_risk_reward", 0.0)),
             max_fvg_age_bars=int(strategy_cfg.get("max_fvg_age_bars", 24)),
             min_fvg_atr_ratio=float(strategy_cfg.get("min_fvg_atr_ratio", 0.0)),

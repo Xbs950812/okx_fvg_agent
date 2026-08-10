@@ -575,18 +575,37 @@ def execute_signal(
         sl_px_safe = f"{_sl_val * (1 + _sl_slippage):.{px_precision}f}"
 
     # 限价单：只在 FVG 理想入场价挂单，等待回补成交
-    ord_id = client.place_order(
-        inst_id=signal.inst_id,
-        side=side,
-        pos_side=pos_side,
-        sz=sz_str,
-        px=entry_px,
-        ord_type="limit",
-        td_mode=risk_cfg["margin_mode"],
-    )
+    # 深挂 conditional 触发单 (2026-08-10 用户要求): 回补位距现价超过有效
+    # 阈值(ATR 挂钩)时, 不直接挂深限价(空转/逆向选择), 改挂触发单 — 价格
+    # 先走到距回补位一个阈值窗口的触发位, 触发后才以回补位限价进场。
+    if (getattr(signal, "use_conditional_entry", False)
+            and float(getattr(signal, "entry_trigger_px", 0) or 0) > 0):
+        ord_id = client.place_plan_order(
+            inst_id=signal.inst_id,
+            td_mode=risk_cfg["margin_mode"],
+            side=side,
+            pos_side=pos_side,
+            sz=sz_str,
+            trigger_px=float(signal.entry_trigger_px),
+            ord_px=float(signal.entry_price),
+        )
+        if ord_id:
+            logger.info(
+                f"[PlanEntry] {signal.inst_id} 深挂改 conditional 触发单 "
+                f"trigger={signal.entry_trigger_px:.6g} entry={entry_px}")
+    else:
+        ord_id = client.place_order(
+            inst_id=signal.inst_id,
+            side=side,
+            pos_side=pos_side,
+            sz=sz_str,
+            px=entry_px,
+            ord_type="limit",
+            td_mode=risk_cfg["margin_mode"],
+        )
     if not ord_id:
         logger.warning(
-            f"[Limit] {signal.inst_id} 限价单创建失败，放弃本轮（不追市价）"
+            f"[Limit] {signal.inst_id} 挂单创建失败，放弃本轮（不追市价）"
         )
         return None
 

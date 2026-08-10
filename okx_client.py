@@ -826,6 +826,60 @@ class OKXClient:
                 time.sleep(1)
         return None, "查询失败(无法核验)"
 
+    def place_plan_order(self, inst_id: str, td_mode: str,
+                         side: str, pos_side: str, sz: str,
+                         trigger_px: float, ord_px: float,
+                         trigger_px_type: str = "last") -> Optional[str]:
+        """计划委托 (conditional 触发单) — 价格触及 trigger_px 后以 ord_px 限价进场。
+
+        2026-08-10 用户要求: 深挂 FVG 回补位不直接挂限价单（提前深挂易空转、
+        被逆向选择），改挂触发单 — 价格先走到距回补位一个有效阈值窗口的
+        触发位，触发后才以回补位限价进场，避免空转也不错过深回补机会。
+
+        POST /api/v5/trade/order-algo, ordType=conditional (开仓, reduceOnly=false)
+
+        Args:
+            trigger_px: 触发价 (最新价触及后激活委托)
+            ord_px: 触发后的委托价 (FVG 回补位)
+
+        Returns:
+            algo_id 或 None
+        """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Plan order(conditional): {side} {sz} "
+                        f"{inst_id} trigger={trigger_px} ord={ord_px}")
+            return "dry_run_plan_" + str(int(time.time() * 1000))
+
+        body = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "conditional",
+            "sz": sz,
+            "triggerPx": f"{trigger_px}",
+            "triggerPxType": trigger_px_type,
+            "ordPx": f"{ord_px}",
+            "reduceOnly": "false",
+            "algoClOrdId": self._gen_cl_ord_id("plan"),
+        }
+        try:
+            result = _call_sdk_retry(
+                self._trade._request, POST, PLACE_ALGO_ORDER, body)
+            if result.get("code") == "0" and result.get("data"):
+                algo_id = result["data"][0].get("algoId", "")
+                logger.info(f"Plan order(conditional) placed: {algo_id} — "
+                            f"{side} {sz} {inst_id} "
+                            f"trigger={trigger_px} ord={ord_px}")
+                return algo_id
+            logger.warning(
+                f"place_plan_order failed: code={result.get('code')} "
+                f"msg={result.get('msg')} ({inst_id} trigger={trigger_px})")
+            return None
+        except Exception as e:
+            logger.error(f"place_plan_order exception: {e}")
+            return None
+
     def cancel_algo_order(self, algo_id: str, inst_id: str = "") -> bool:
         """撤销策略订单。
 
