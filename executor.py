@@ -461,6 +461,9 @@ def execute_signal(
         # 不再警告放行: 降杠杆使爆仓距离扩至覆盖止损距离, 止损必然先触发,
         # 单笔亏损 ≤ 保证金。新杠杆 = floor(1/(止损距离/安全系数 + MMR))。
         # 数学: liq_dist_new = 1/new_lev - mmr ≥ stop_dist/safety → 覆盖。
+        # 边界: floor 向下取整只会让 new_lev 更小 → liq_dist_new 更大 → 更安全
+        # (stop_dist 极小如 1% 时 new_lev 恰好卡边界, 仍有 floor 余量 + 下方
+        # 冗余校验双保险; liq_dist_new ≤ 0 时冗余校验直接拒单)。
         _need_lev = 1.0 / (_stop_dist / _safety + _mmr)
         _new_lev = max(1, int(math.floor(_need_lev)))
         if _new_lev >= _eff_leverage:

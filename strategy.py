@@ -2025,6 +2025,9 @@ def scan_fvg_all_timeframes(
             atr_stop_multiplier=float(strategy_cfg.get("atr_stop_multiplier", 2.0)),
             atr_reject_ratio=float(strategy_cfg.get("atr_reject_ratio", 0.8)),
             leverage_stop_budget_pct=float(strategy_cfg.get("leverage_stop_budget_pct", 2.5)),
+            # 注: 满倍率模式(2026-08-09起, max_position_leverage=0)下此建议杠杆
+            # 被 agent 主循环 resolve_full_leverage 覆盖为币种最大杠杆, 仓位结构
+            # 兜底由 executor.LiqCheck 降杠杆(止损先于爆仓)承担, 见 config 注释。
             swing_lookback_bars=strategy_cfg.get("swing_lookback_bars", 24),
             pullback_lookback=strategy_cfg.get("pullback_lookback", 8),
             max_tp_distance_pct=strategy_cfg.get("max_tp_distance_pct", 25.0),

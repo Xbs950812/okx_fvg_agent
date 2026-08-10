@@ -2,6 +2,26 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] chore: 仓位结构审查收尾 — 死配置清理 + 杠杆审计字段 + 边界注释
+
+### 背景（仓位结构二层问题代码审查产出）
+审查确认降杠杆止损优先链路已闭环，清理 3 个遗留项：
+1. `leverage_stop_budget_pct` 是死配置 — 满倍率模式下被 `resolve_full_leverage`
+   覆盖，反推联动从未生效，config 注释误导（"满杠杆测试档位"）
+2. 降杠杆极端边界（stop_dist 极小卡边界）数学安全但无注释说明
+3. 降杠杆后的实际杠杆不落盘，复盘无法看到"这笔实际用了 15x 而非 50x"
+
+### 修改
+- `config.json` `leverage_stop_budget_pct` 注释重写：明确满倍率下已被覆盖、
+  仅 max_position_leverage>0 时参与；仓位结构兜底由 LiqCheck 承担
+- `strategy.py` 杠杆联动处补说明注释（同上）
+- `executor.py` 降杠杆公式补边界注释（floor 方向安全性 + 冗余校验兜底）
+- `agent.py` active_signals 新增 `exec_leverage` 字段：记录 execute_signal
+  降杠杆后的实际执行杠杆（在 finally 恢复原始杠杆之前落盘）
+
+### 验证
+- 回归 38/38 全过；重启 agent 生效
+
 ## [2026-08-10] fix: 满倍率降杠杆止损优先 — 止损必先于爆仓（用户要求"先止损再爆仓"）
 
 ### 背景（穿仓事故第二层根因）

@@ -1968,6 +1968,10 @@ def _execute_signal_with_quant_enhancements(
             # 若不清零, 同币种二次开仓会直接跳过第一档进入第二档检查。
             _sig_slot["scaled_out"] = 0
             _sig_slot["signal_tp"] = float(signal.take_profit)
+            # 修复 2026-08-10: 记录实际执行杠杆 — 满倍率下 execute_signal 可能
+            # 因"止损先于爆仓"降杠杆(50x→15x), signal.leverage 此处已是被
+            # 降杠杆后的值(finally 恢复在外层), 落盘供复盘审计/监控查看。
+            _sig_slot["exec_leverage"] = float(signal.leverage)
             # CE 中点失效(2026-08-07): 记录信号 FVG 中点, trailing 据此判断
             # 结构失效(实体收盘越过中点→止损提到成本价), 不再死等原止损。
             try:
