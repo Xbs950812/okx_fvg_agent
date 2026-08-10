@@ -438,8 +438,8 @@ def execute_signal(
     _safety = float(risk_cfg.get("liq_safety_factor", 0.5) or 0.5)
     # 满倍率模式 (2026-08-09): 满杠杆下爆仓距离(1/杠杆)通常远小于 FVG 止损距离，
     # 若保持 fail-closed 将拒掉全部信号。liq_check_fail_closed=false(默认) 时
-    # 止损=爆仓视为用户接受的逐仓模型(爆仓只损该仓保证金)，降级为警告放行；
-    # 仅杠杆异常(liq_dist<=0) 或显式配置 true 时拒单。
+    # 不再放行: 2026-08-10 起降杠杆使止损先于爆仓(用户要求), 仅杠杆异常
+    # (liq_dist<=0) 或显式配置 true 时拒单。
     _fail_closed = bool(risk_cfg.get("liq_check_fail_closed", False))
     if _liq_dist <= 0:
         logger.error(
@@ -450,12 +450,36 @@ def execute_signal(
         _msg = (
             f"[LiqCheck] {signal.inst_id} 止损距离 {_stop_dist:.2%} >= "
             f"爆仓距离 {_liq_dist:.2%} × {_safety:.0%} "
-            f"(杠杆 {_eff_leverage}x, MMR {_mmr:.3%}) — 满杠杆下止损=爆仓"
+            f"(杠杆 {_eff_leverage}x, MMR {_mmr:.3%}) — 止损先于爆仓"
         )
         if _fail_closed:
             logger.error(_msg + "，拒单(fail-closed)")
             return None
-        logger.warning(_msg + "，警告放行(逐仓爆仓只损该仓保证金)")
+        # 修复 2026-08-10 (用户要求"先止损再爆仓"): 满杠杆下止损距离 ≥ 爆仓
+        # 安全距离 = 价格必先爆仓后止损。paper 引擎曾缺强平模拟按全额亏损
+        # 结算(实测 PUMP 50x SL=-5.09% vs 爆仓-2% → 单笔 -28.85 穿仓)。
+        # 不再警告放行: 降杠杆使爆仓距离扩至覆盖止损距离, 止损必然先触发,
+        # 单笔亏损 ≤ 保证金。新杠杆 = floor(1/(止损距离/安全系数 + MMR))。
+        # 数学: liq_dist_new = 1/new_lev - mmr ≥ stop_dist/safety → 覆盖。
+        _need_lev = 1.0 / (_stop_dist / _safety + _mmr)
+        _new_lev = max(1, int(math.floor(_need_lev)))
+        if _new_lev >= _eff_leverage:
+            logger.error(
+                _msg + f"，降杠杆无效(需 ≤{_new_lev}x 仍 ≥ 当前 {_eff_leverage}x)，拒单")
+            return None
+        logger.warning(
+            f"[LiqCheck] {signal.inst_id} 降杠杆止损优先: {_eff_leverage}x → {_new_lev}x "
+            f"(止损 {_stop_dist:.2%} ≥ 爆仓安全距离 {_liq_dist:.2%}×{_safety:.0%}, "
+            f"降杠杆后爆仓距离 {1.0 / _new_lev - _mmr:.2%}×{_safety:.0%} 覆盖止损)"
+        )
+        signal.leverage = _new_lev
+        _eff_leverage = _new_lev
+        _liq_dist = 1.0 / max(_new_lev, 1) - _mmr
+        if _stop_dist >= _liq_dist * _safety:
+            # 冗余保护: 数学上 floor 后不应发生, 防御浮点/参数异常
+            logger.error(
+                f"[LiqCheck] {signal.inst_id} 降杠杆后仍不满足止损优先，拒单")
+            return None
     else:
         logger.debug(
             f"[LiqCheck] {signal.inst_id} 通过: 止损距离 {_stop_dist:.2%} "

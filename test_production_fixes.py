@@ -61,10 +61,9 @@ class _FakeClient:
         return "plan1"
 
 
-def _run_execute(inst_id, side, entry, sl, tp, leverage, client=None,
-                 risk_cfg=None):
+def _run_execute_sig(inst_id, side, entry, sl, tp, leverage, client=None,
+                     risk_cfg=None):
     from executor import execute_signal
-    from okx_client import OKXClient
     # execute_signal 只使用 client 的部分方法，用假客户端即可；
     # 类型仅用于 isinstance 检查（无），故直接传入假客户端
     _client = client or _FakeClient()
@@ -79,8 +78,15 @@ def _run_execute(inst_id, side, entry, sl, tp, leverage, client=None,
         _config["risk"].update(risk_cfg)
     _signal = _make_signal(inst_id=inst_id, side=side,
                            entry=entry, sl=sl, tp=tp, leverage=leverage)
-    return execute_signal(_client, _signal, equity=100.0,
-                          config=_config, instrument_info=_client.get_instrument_info(inst_id))
+    ord_id = execute_signal(_client, _signal, equity=100.0,
+                            config=_config, instrument_info=_client.get_instrument_info(inst_id))
+    return ord_id, _signal
+
+
+def _run_execute(inst_id, side, entry, sl, tp, leverage, client=None,
+                 risk_cfg=None):
+    return _run_execute_sig(inst_id, side, entry, sl, tp, leverage,
+                            client=client, risk_cfg=risk_cfg)[0]
 
 
 def test_liq_check_rejects_high_leverage():
@@ -108,21 +114,65 @@ def test_liq_check_uses_tier_mmr():
 
 
 def test_liq_check_full_leverage_default_allow():
-    """满倍率模式 (2026-08-09): liq_check_fail_closed 默认 false —
-    满杠杆下止损=爆仓(逐仓爆仓只损该仓保证金) 警告放行，仅杠杆非法时拒单。
+    """满倍率模式 (2026-08-10): liq_check_fail_closed 默认 false —
+    满杠杆下止损距离 ≥ 爆仓安全距离时**降杠杆**使止损先于爆仓(用户要求
+    "先止损再爆仓"), 不再警告放行; 仅杠杆非法时拒单。
 
-    用户模型: 30% 余额做保证金 × 币种最大杠杆, 剩余 70% 余额当爆仓缓冲。
+    用户模型: 30% 余额做保证金 × 币种最大杠杆, 剩余 70% 余额当爆仓缓冲;
+    2026-08-10 起强制止损先于爆仓, 单笔亏损 ≤ 保证金。
     """
-    # 50x + 3% 止损: liq_dist=1.5%, 止损 3% ≥ 1.5%×0.5 → 默认警告放行
+    # 50x + 3% 止损: liq_dist=1.5%, 止损 3% ≥ 1.5%×0.5 → 降杠杆止损优先
     client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
-    ord_id = _run_execute("FULLLEV-SWAP", "long", 100.0, 97.0, 104.0, 50,
-                          client=client, risk_cfg={"liq_check_fail_closed": False})
-    assert ord_id is not None, "满倍率默认(不fail-closed)应警告放行"
+    ord_id, sig = _run_execute_sig("FULLLEV-SWAP", "long", 100.0, 97.0, 104.0, 50,
+                                   client=client,
+                                   risk_cfg={"liq_check_fail_closed": False})
+    assert ord_id is not None, "满倍率默认(不fail-closed)应降杠杆放行"
+    # 验证降杠杆: 新杠杆 = floor(1/(3%/0.5 + 0.5%)) = floor(15.38) = 15x
+    assert sig.leverage == 15, f"应降杠杆到 15x, 实际 {sig.leverage}x"
+    # 验证止损先于爆仓: 15x 爆仓距离 = 6.67%-0.5% = 6.17%, 安全距离 3.08% > 3%
+    assert 3.0 < (1.0 / sig.leverage - 0.005) * 0.5 * 100 + 1e-9, \
+        "降杠杆后爆仓安全距离必须覆盖止损距离"
     # 杠杆非法 (爆仓距离≤0) 时即使 fail-closed=false 也必须拒单
     client2 = _FakeClient(tiers={"mmr": "0.005", "maxLever": "1000"})
     # 1000x: 1/1000=0.1% - 0.5% < 0 → liq_dist<=0 拒单
-    ord_id2 = _run_execute("BADLEV-SWAP", "long", 100.0, 97.0, 104.0, 1000, client=client2)
+    ord_id2 = _run_execute("BADLEV-SWAP", "long", 100.0, 97.0, 104.0, 1000,
+                           client=client2)
     assert ord_id2 is None, "杠杆非法(爆仓距离≤0)必须拒单"
+
+
+def test_liq_check_derates_leverage_stop_first():
+    """降杠杆止损优先 (2026-08-10 用户要求): SL 先于爆仓触发, 亏损 ≤ 保证金。
+
+    回归: 满倍率警告放行 → 50x + SL=-5.09% vs 爆仓 -2% → 价格先爆仓,
+    paper 缺强平模拟按全额亏损结算, 单笔 -28.85 超过保证金 11.40 穿仓。
+    修复后: 50x+5% 止损 → 降杠杆到 9x (floor(1/(5%/0.5+0.5%))=floor(9.52)=9),
+    爆仓距离 11.1%-0.5%=10.6%, 安全距离 5.3% > 5% → 止损必然先触发。
+    """
+    client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
+    ord_id, sig = _run_execute_sig("DERATE-SWAP", "long", 100.0, 95.0, 110.0, 50,
+                                   client=client,
+                                   risk_cfg={"liq_check_fail_closed": False})
+    assert ord_id is not None, "应降杠杆放行(非拒单)"
+    assert sig.leverage == 9, f"应降杠杆到 9x, 实际 {sig.leverage}x"
+    _liq = 1.0 / sig.leverage - 0.005
+    assert 5.0 / 100.0 < _liq * 0.5 + 1e-9, \
+        f"止损距离必须小于爆仓安全距离, liq={_liq:.4f}"
+    # SL 距离保留原值(降杠杆不牺牲止损宽度)
+    assert abs(sig.stop_loss - 95.0) < 1e-9, "降杠杆不得改动止损价"
+
+
+def test_liq_check_derate_short_side():
+    """做空方向降杠杆 (2026-08-10): 止损方向对称, 爆仓点在 entry 上方。
+    3% 止损 → floor(1/(3%/0.5+0.5%)) = floor(15.38) = 15x。
+    """
+    client = _FakeClient(tiers={"mmr": "0.005", "maxLever": "50"})
+    ord_id, sig = _run_execute_sig("SHORT-DERATE", "short", 100.0, 103.0, 96.0, 50,
+                                   client=client,
+                                   risk_cfg={"liq_check_fail_closed": False})
+    assert ord_id is not None
+    assert sig.leverage == 15, f"做空应降杠杆到 15x, 实际 {sig.leverage}x"
+    _liq = 1.0 / sig.leverage - 0.005
+    assert 3.0 / 100.0 < _liq * 0.5 + 1e-9
 
 
 def test_resolve_full_leverage_uses_tier_max():
