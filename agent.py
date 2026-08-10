@@ -1914,6 +1914,18 @@ def _execute_signal_with_quant_enhancements(
             return None
 
     # ---- 3. 执行下单 ----
+    # 修复 2026-08-10: 同轮内纸面平仓后, 传入的 equity 是轮首快照(含已平仓
+    # 浮盈), 直接用于开仓会超额 — 实测 13:54 平仓 -5.29 后, 13:56 同轮开新仓
+    # 仍用 38.01(含已平仓浮盈) → 保证金 11.40, 实际余额 25.35 只该用 7.60。
+    # 下单前刷新为当前真实权益, 保证以损定量/保证金口径正确。
+    if paper_engine is not None:
+        try:
+            _fresh_equity = paper_engine.get_equity()
+            if _fresh_equity is not None and _fresh_equity > 0:
+                equity = _fresh_equity
+        except Exception as _pe:
+            logger.debug(
+                f"[Paper] {signal.inst_id} 开仓前权益刷新失败: {_pe}")
     # 满倍率模式 (2026-08-09 用户要求): 执行杠杆 = 币种最大杠杆 (tiers.maxLever)，
     # 统一在执行前覆盖 signal.leverage，保证实盘(dry-run)与纸面引擎口径一致。
     # 剩余余额全部留在账户当爆仓缓冲 (isolated 逐仓爆仓只损该仓 30% 保证金)。

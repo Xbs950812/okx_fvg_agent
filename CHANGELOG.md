@@ -2,6 +2,25 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] fix: 同轮平仓后开新仓 equity 过期 — 纸面超额开仓
+
+### 问题（盯盘实测发现）
+主循环 equity 每轮**步骤 0** 快照一次（`paper_engine.get_equity()`）。若同轮内
+先发生平仓（paper update 同步平仓）再执行新信号开仓，`_execute_signal_with_quant_
+enhancements` 仍用**轮首快照** equity 计算仓位：
+实测 13:54 第二笔 PUMP 止损 -5.29 后，13:56 同轮开第三笔 PUMP 仍用 equity=38.01
+（含已平仓位的浮盈 12.66）→ 保证金 11.40（30%×38.01），而真实余额 25.35 只该
+用 7.60（30%×25.35）→ **超额开仓 ~50%**，违反"30% 保证金 + 70% 爆仓缓冲"模型。
+
+### 修复
+- `agent._execute_signal_with_quant_enhancements` 下单段：paper_engine 存在时
+  开仓前调用 `paper_engine.get_equity()` 刷新 equity（成功才覆盖），保证以损定量
+  /保证金口径用真实余额；实盘模式（paper_engine=None）零改动零额外网络调用
+
+### 验证
+- 回归 66/66 全过（agent.py 改动不影响既有测试）
+- 重启 agent 后观察：同轮平仓→再开仓场景保证金口径正确
+
 ## [2026-08-10] fix: 测试污染真实纸面账户 — state_file 隔离 + 落盘纵深防御
 
 ### 事故（盯盘实测发现，已恢复）
