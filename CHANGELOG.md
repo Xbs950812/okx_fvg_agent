@@ -30,6 +30,34 @@
   杠杆非法拒单）、`test_resolve_full_leverage_uses_tier_max`（tiers 优先/回退/封顶）
 - 回归 12/12 + `tests/` 48/48 全过
 
+## [2026-08-09] 24h 涨跌幅榜优先发现 — 涨幅榜/跌幅榜极端波动币（用户要求）
+
+### 需求（用户原话）
+"你知道为什么总是找不到好的行情吗，因为你没有查找涨幅榜和跌幅榜，因为在 OKX 里
+有一个涨幅榜和跌幅榜，里面动辄十几个百分比的多空"
+
+### 问题
+原系统 `get_tradable_coins` 只按**成交量降序**选币（Top 100），涨幅榜/跌幅榜里
+动辄 ±10%+ 的极端波动币（MUBARAK +43%、BICO -45%、CAP +31%…）排不进扫描队列
+——而它们正是 FVG Hunter 硬门禁（ADX≥25 + ATR≥2%）的理想猎场（"找不到好行情"根因）。
+
+### 实现
+- `executor.compute_movers(tickers, config)`：从全量 SWAP tickers 计算 24h 涨跌幅
+  （last vs open24h），按 |涨跌幅| 降序返回榜单币种（复用同一份 tickers，零额外 API）
+  - 成交量门槛放宽到 min_volume_24h_usd（1M，主扫描 5M 的 1/5，极端波动币多为中盘）
+  - 过滤 last≤0 / open24h≤0 的无效 ticker，|涨跌|≥min_move_pct(8%) 才入选
+- `executor.get_tradable_coins`：涨跌幅榜币种插入扫描队列**最前**（先于成交量排序），
+  条目带 move_pct 字段供日志/排序；调用点零改动（CoinTracker/预热/WebSocket 订阅共用）
+- `config.json` / `config.example.json`：新增 `market_movers` 段
+  （enabled / count=20 / min_move_pct=8 / min_volume_24h_usd=1M）
+
+### 验证
+- 新增回归 `test_compute_movers_priority_and_thresholds`（榜单入选/按|涨跌|降序/
+  量不足与低波剔除/enabled=false 空列表）
+- 实测扫描队列前 20 名全为涨跌幅榜币种（MUBARAK +47% / BICO -44% / CAP +30%…），
+  成交量排序币种（SATS/PEPE/SHIB）退至第 21 名起
+- 回归 13/13 + `tests/` 48/48 全过
+
 ## [2026-08-09] 纸面移动止损 ATR 静默失效修复（RAVE 实测）
 
 ### 问题（挡位1测试实测）

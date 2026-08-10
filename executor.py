@@ -843,17 +843,77 @@ def manage_pending_orders(
 # 获取合约标的列表
 # ---------------------------------------------------------------------------
 
+def compute_movers(tickers: list, config: dict) -> List[dict]:
+    """从全量 SWAP tickers 计算 24h 涨跌幅榜/跌幅榜 (2026-08-09 用户要求)。
+
+    OKX 涨幅榜/跌幅榜里动辄 ±10%+ 的极端波动币种，正是 FVG Hunter 硬门禁
+    (ADX≥25 + ATR≥2%) 的理想猎场。原系统只按成交量排序选币，涨跌幅榜币种
+    排到 100 名之后根本进不了扫描队列 —— 导致"总是找不到好行情"。
+
+    使用同一份 tickers 数据（不额外调用 API），与 get_tradable_coins 共享。
+
+    Args:
+        tickers: OKXClient.get_tickers() 原始返回 (全量 SWAP)
+        config: 完整配置 (读取 market_movers 段)
+
+    Returns:
+        按 |24h 涨跌幅| 降序的榜单币种 (结构同 get_tradable_coins 返回，
+        另含 move_pct 字段)。market_movers.enabled=false 时返回 []。
+    """
+    mv_cfg = config.get("market_movers", {}) or {}
+    if not mv_cfg.get("enabled", True):
+        return []
+    count = int(mv_cfg.get("count", 20) or 20)
+    min_move = float(mv_cfg.get("min_move_pct", 8.0) or 8.0)
+    min_vol = float(mv_cfg.get("min_volume_24h_usd", 1_000_000) or 1_000_000)
+
+    rows = []
+    for t in tickers:
+        inst_id = t.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+        last = float(t.get("last", "0") or 0)
+        open24 = float(t.get("open24h", "0") or 0)
+        vol24h = float(t.get("volCcy24h", "0") or 0)
+        if last <= 0 or open24 <= 0 or vol24h < min_vol:
+            continue
+        pct = (last - open24) / open24 * 100.0
+        if abs(pct) < min_move:
+            continue
+        rows.append({
+            "instId": inst_id,
+            "last": last,
+            "vol24h": vol24h,
+            "bidPx": float(t.get("bidPx", "0") or 0),
+            "askPx": float(t.get("askPx", "0") or 0),
+            "high24h": float(t.get("high24h", "0") or 0),
+            "low24h": float(t.get("low24h", "0") or 0),
+            "move_pct": pct,   # 24h 涨跌幅 (%), 供优先级排序/日志
+        })
+    rows.sort(key=lambda x: abs(x["move_pct"]), reverse=True)
+    return rows[:count]
+
+
 def get_tradable_coins(
     client: OKXClient,
     config: dict,
 ) -> List[dict]:
     """获取可交易的 USDT 本位永续合约列表，按成交量排序。
 
+    优先级 (2026-08-09 用户要求):
+        1. 24h 涨跌幅榜/跌幅榜币种 (极端波动, FVG Hunter 理想猎场) 排最前
+        2. 其余按成交量降序
+
     Returns:
         [{"instId": "BTC-USDT-SWAP", "last": 50000, "vol24h": 1e9, ...}, ...]
+        榜单币种额外带 move_pct 字段。
     """
     tickers = client.get_tickers(inst_type="SWAP")
     limit = config["agent"].get("coin_scan_limit", 100)
+
+    # 24h 涨跌幅榜/跌幅榜优先 (同一份 tickers 数据, 零额外 API 调用)
+    movers = compute_movers(tickers, config)
+    mover_ids = {m["instId"] for m in movers}
 
     # 只保留 USDT 本位永续合约
     usdt_swaps = []
@@ -861,6 +921,8 @@ def get_tradable_coins(
         inst_id = t.get("instId", "")
         if not inst_id.endswith("-USDT-SWAP"):
             continue
+        if inst_id in mover_ids:
+            continue  # 涨跌幅榜币种已单独收集
 
         vol24h = float(t.get("volCcy24h", "0"))
         if vol24h < config["strategy"]["min_volume_24h_usd"]:
@@ -878,7 +940,12 @@ def get_tradable_coins(
 
     # 按成交量降序
     usdt_swaps.sort(key=lambda x: x["vol24h"], reverse=True)
-    return usdt_swaps[:limit]
+    if movers:
+        logger.info(
+            f"[Movers] {len(movers)} 个 24h 涨跌幅榜币种优先进入扫描队列: "
+            + ", ".join(f"{m['instId']}({m['move_pct']:+.1f}%)" for m in movers[:5])
+        )
+    return (movers + usdt_swaps)[:limit]
 
 
 # ---------------------------------------------------------------------------

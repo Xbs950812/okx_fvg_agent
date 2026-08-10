@@ -136,6 +136,16 @@
     "min_traders_holding": 2,
     "refresh_interval_cycles": 3
   },
+  "market_movers": {
+    "_comment": "OKX 24h 涨跌幅榜优先发现 (2026-08-09 用户要求): 涨幅榜/跌幅榜里动辄 ±10%+ 的极端波动币种, 正是 FVG Hunter 硬门禁(ADX≥25+ATR≥2%)的理想猎场。原系统只按成交量排序, 榜单币种排不进 Top 100 导致'找不到好行情'。榜上币种插入扫描队列最前",
+    "enabled": true,
+    "count": 20,
+    "_count_comment": "涨跌幅榜最多进入扫描队列的币种数 (涨幅榜+跌幅榜合计)",
+    "min_move_pct": 8.0,
+    "_min_move_pct_comment": "24h 涨跌幅阈值: |涨跌| ≥ 该 % 才进入优先队列 (8%=动辄十几个百分比的量级下限)",
+    "min_volume_24h_usd": 1000000,
+    "_min_volume_comment": "涨跌幅榜币种最低成交量(过滤归零/无流动性币): 1M = 主扫描 min_volume(5M) 的 1/5, 极端波动币多为中盘"
+  },
   "report": {
     "_comment": "定时研究报告 — 亚洲/欧美时段转换时生成报告",
     "enabled": true,

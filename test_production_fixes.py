@@ -135,6 +135,54 @@ def test_resolve_full_leverage_uses_tier_max():
     assert lev3 == 5, f"配置封顶 5x 应生效, 实际 {lev3}x"
 
 
+def _mk_ticker(inst_id, last, open24, vol, bid=None, ask=None, high=None, low=None):
+    return {
+        "instId": inst_id,
+        "last": str(last),
+        "open24h": str(open24),
+        "volCcy24h": str(vol),
+        "bidPx": str(bid if bid is not None else last),
+        "askPx": str(ask if ask is not None else last),
+        "high24h": str(high if high is not None else last),
+        "low24h": str(low if low is not None else last),
+    }
+
+
+def test_compute_movers_priority_and_thresholds():
+    """涨跌幅榜 (2026-08-09 用户要求): 极端波动币种优先进扫描队列。"""
+    from executor import compute_movers
+    tickers = [
+        # inst, last, open24h, vol24h
+        _mk_ticker("BTC-USDT-SWAP", 60000, 60000, 5_000_000_000),   # 0% 不入选
+        _mk_ticker("MUBARAK-USDT-SWAP", 1.43, 1.00, 600_000_000),   # +43% 涨幅榜
+        _mk_ticker("BICO-USDT-SWAP", 0.554, 1.00, 300_000_000),     # -44.6% 跌幅榜
+        _mk_ticker("SMALL-USDT-SWAP", 1.20, 1.00, 500_000),         # +20% 但量不足 1M → 剔除
+        _mk_ticker("LOWPCT-USDT-SWAP", 1.05, 1.00, 50_000_000),     # +5% < 8% → 剔除
+        _mk_ticker("BOME-USDT-SWAP", 1.24, 1.00, 10_000_000_000),   # +24% 涨幅榜
+        _mk_ticker("ETH-USDT-SWAP", 3500, 3450, 8_000_000_000),     # +1.4% 不入选
+    ]
+    cfg = {"market_movers": {"enabled": True, "count": 20,
+                             "min_move_pct": 8.0,
+                             "min_volume_24h_usd": 1_000_000}}
+    movers = compute_movers(tickers, cfg)
+    ids = [m["instId"] for m in movers]
+    # 涨幅榜+跌幅榜都入选, 且按 |涨跌幅| 降序 (BICO -44.6% 排最前)
+    assert "MUBARAK-USDT-SWAP" in ids
+    assert "BICO-USDT-SWAP" in ids
+    assert "BOME-USDT-SWAP" in ids
+    assert ids[0] == "BICO-USDT-SWAP", f"应按 |涨跌幅| 降序, 实际 {ids}"
+    assert ids[1] == "MUBARAK-USDT-SWAP", f"应按 |涨跌幅| 降序, 实际 {ids}"
+    # 成交量不足 1M 与 |涨跌|<8% 被剔除
+    assert "SMALL-USDT-SWAP" not in ids
+    assert "LOWPCT-USDT-SWAP" not in ids
+    assert "BTC-USDT-SWAP" not in ids
+    # move_pct 字段带 24h 涨跌幅
+    by_id = {m["instId"]: m for m in movers}
+    assert abs(by_id["BICO-USDT-SWAP"]["move_pct"] - (-44.6)) < 0.01
+    # enabled=false 时返回空
+    assert compute_movers(tickers, {"market_movers": {"enabled": False}}) == []
+
+
 def test_pending_close_meta_roundtrip():
     """P0-D: _pending_close 含不可序列化对象时 save/load 往返不丢元数据。"""
     with tempfile.TemporaryDirectory() as td:
