@@ -197,7 +197,9 @@ class PaperTradingEngine:
             ocfg.get("trailing_stop_activation_pct", 0.5))
         self.ts_trail_pct: float = float(ocfg.get("trailing_stop_trail_pct", 0.03))
         self.ts_atr_activation_mult: float = 0.5    # 0.5x ATR ≈ 1% 价格移动
-        self.ts_atr_trail_mult: float = 0.75        # 0.75x ATR ≈ 1.5% 追踪距离
+        # 2026-08-10 用户要求: 追踪距离 0.75x→1.5x ATR (≈3% 价格移动) —
+        # 实测 PUMP 峰值 +1.38% 时 0.75xATR 追踪仅 1.87% 空间, 刚激活就被回撤扫掉(锁在成本下方)。
+        self.ts_atr_trail_mult: float = 1.5         # 1.5x ATR ≈ 3% 追踪距离
         self.max_hold_hours: float = float(rcfg.get("max_hold_hours", 48))
         self.dynamic_roi: Dict[str, float] = dict(
             rcfg.get("dynamic_roi", {"240": 0.015, "120": 0.025, "60": 0.035, "0": 0.05})

@@ -411,7 +411,7 @@ class TrailingStop:
                  activation_pct: float = 0.70,     # 回退兼容: TP 目标百分比激活（已弃用为主逻辑）
                  trail_pct: float = 0.03,           # 回退兼容: 固定百分比追踪距离（已弃用为主逻辑）
                  atr_activation_multiplier: float = 0.5,  # ATR 激活倍数: 0.5x ATR ≈ 1% 价格移动 (2% ATR 时)
-                 trail_atr_multiplier: float = 0.75,      # ATR 追踪倍数: 0.75x ATR ≈ 1.5% 追踪距离
+                 trail_atr_multiplier: float = 1.5,      # ATR 追踪倍数: 1.5x ATR ≈ 3% 追踪距离 (2026-08-10 用户要求: 0.75→1.5, 防刚激活就被扫)
                  ):
         self.activation_pct = activation_pct
         self.trail_pct = trail_pct
