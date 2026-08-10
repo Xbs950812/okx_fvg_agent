@@ -588,6 +588,48 @@ def test_paper_conditional_trigger():
     assert pos.extra.get("trigger_activated", False), "应记录触发状态"
 
 
+def test_paper_update_sl_tighten_only():
+    """纸面止损同步 (2026-08-10): 主循环 CE 抬止损(0R) 必须同步到纸面 sl_px,
+    且只向有利方向收紧不放松。
+
+    回归: CE 抬止损只作用于实盘路径, 纸面死等原止损 → 同跌至成本价时实盘
+    已 0R 保本出场, 纸面仍亏 -1R, 纸面 PnL 与实盘口径不一致。
+    """
+    from paper_trading import PaperTradingEngine
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 1, "max_positions": 1,
+                     "max_hold_hours": 48},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=98.5, tp=104.0, leverage=1)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True
+        assert pos.sl_px == 98.5
+        # CE 抬止损到成本价 → 纸面 SL 同步上移
+        eng.update_sl("BTC-USDT-SWAP", 100.0)
+        assert pos.sl_px == 100.0, f"CE 抬止损应同步到纸面, 实际 {pos.sl_px}"
+        # 只收紧不放松: 新 SL 低于当前 → 忽略
+        eng.update_sl("BTC-USDT-SWAP", 99.0)
+        assert pos.sl_px == 100.0, "止损不得向不利方向放松"
+        # 再收紧仍生效
+        eng.update_sl("BTC-USDT-SWAP", 100.5)
+        assert pos.sl_px == 100.5
+        # 未成交挂单不生效
+        eng.open_position(_make_signal("ETH-USDT-SWAP", "long", entry=200.0,
+                                       sl=195.0, tp=220.0, leverage=1),
+                          instrument_info, cfg["risk"], equity=100.0)
+        eng.update_sl("ETH-USDT-SWAP", 199.0)
+        assert eng._positions["ETH-USDT-SWAP"].sl_px == 195.0, \
+            "未成交挂单不得被 CE 抬止损影响"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

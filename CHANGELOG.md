@@ -2,6 +2,26 @@
 
 本项目维护变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2026-08-10] fix: CE 抬止损纸面不同步 — 纸面 PnL 与实盘口径不一致
+
+### 问题（盯盘实测发现）
+纸面模式下主循环对纸面持仓同样执行 CE 中点失效判定（[CE] ... 止损提到成本价 0R），
+并沿实盘路径重挂保护单（dry-run 单 SL=成本价）。但 **paper 引擎内部 sl_px 未同步**：
+实测 BOME-USDT-SWAP entry=0.0007783，dry-run 保护单 SL=0.0007783（0R），
+而 paper_state.json 的 sl_px 仍为 0.0007084（-1R）→ 若价格跌到成本价，实盘等价路径
+已 0R 保本出场，纸面却死等原止损吃满 -1R，纸面验证结果失真。
+
+### 修复
+- `paper_trading.PaperTradingEngine.update_sl(inst_id, new_sl)`：纸面止损同步方法，
+  只向有利方向收紧不放松（long 上移 / short 下移），未成交挂单不生效，带锁+落盘
+- `agent.py` CE 路径：`_ce_locked` 保本锁定 clamp 后同步调用
+  `paper_engine.update_sl(inst_id, new_sl)`（CE 触发或已锁定均同步）
+
+### 验证
+- 新增回归 `test_paper_update_sl_tighten_only`（CE 抬止损同步上移/只收紧不放松/
+  未成交挂单不受影响）
+- 回归 18/18 + `tests/` 48/48 全过
+
 ## [2026-08-10] 深挂回补位升级 — ATR 挂钩深度阈值 + conditional 触发单（用户要求）
 
 ### 需求（用户原话）

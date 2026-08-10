@@ -3665,6 +3665,11 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                             new_sl = max(new_sl, float(pos["avg_px"]))
                         else:
                             new_sl = min(new_sl, float(pos["avg_px"]))
+                    # 纸面同步 (2026-08-10): CE 抬止损(0R)/锁定保本 只作用于
+                    # 实盘路径, 纸面 sl_px 不更新 → 纸面 PnL 与实盘口径不一致
+                    # (同跌至成本价时实盘已 0R 保本出场, 纸面仍死等原止损)。
+                    if paper_engine is not None and (_ce_bad or _ce_locked):
+                        paper_engine.update_sl(inst_id, new_sl)
                     # 修复: 查询该持仓已有的生效保护单（oco/conditional），
                     # 存在则登记到跟踪表并跳过补挂，避免与开仓保护单重复挂单，
                     # 同时在重启后/开仓保护单未登记时实现自愈。

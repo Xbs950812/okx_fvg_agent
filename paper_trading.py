@@ -523,6 +523,31 @@ class PaperTradingEngine:
         pos.extra["ts_best"] = best
         pos.extra["ts_activated"] = activated
 
+    def update_sl(self, inst_id: str, new_sl: float) -> None:
+        """纸面止损同步 (2026-08-10): 主循环 CE 抬止损(0R)/锁定保本 等外部保护
+        决策只作用于实盘路径, 纸面内部 sl_px 不更新会导致纸面 PnL 与实盘口径
+        不一致 — 同跌至成本价时实盘已 0R 保本出场, 纸面仍死等原止损(-1R)。
+
+        只向有利方向收紧, 不放松:
+          - long: 新 SL 高于当前 → 上移
+          - short: 新 SL 低于当前 → 下移
+        """
+        with self._lock:
+            pos = self._positions.get(inst_id)
+            if pos is None or not pos.filled:
+                return
+            if pos.side == "long":
+                if new_sl > pos.sl_px:
+                    pos.sl_px = new_sl
+                    logger.info(
+                        f"[Paper] {inst_id} 止损同步上移 → {new_sl:.6g}")
+            else:
+                if new_sl < pos.sl_px:
+                    pos.sl_px = new_sl
+                    logger.info(
+                        f"[Paper] {inst_id} 止损同步下移 → {new_sl:.6g}")
+            self.save()
+
     def _fill_locked(self, pos: PaperPosition, md: Dict[str, Any],
                      assist: bool = False) -> None:
         """限价单成交；assist=True 为成交加速兜底(按标记价模拟市价成交)。
