@@ -3210,49 +3210,80 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                         logger.info(
                             f"[Switch] {_entry.inst_id} 无可用信号对象，跳过换仓")
                     else:
-                        # 在 risk_gate 之前关闭旧仓位
-                        logger.info(
-                            f"[Switch] active_count={active_count}>={risk_cfg['max_positions']}, "
-                            f"预换仓: {_worst_inst} → {_entry.inst_id} "
-                            f"(score={_best_sig.score:.2f})"
-                        )
-                        close_ord, _is_limit = client.close_position_safe(
-                            inst_id=_worst_inst,
-                            pos_side=_worst_pos["pos_side"],
-                            pos_size=_worst_pos["size"],
-                            mgn_mode=risk_cfg["margin_mode"],
-                        )
-                        if close_ord:
-                            if paper_engine is not None:
-                                paper_engine.close_position(_worst_inst, reason="switch")
-                            _pending_close = {
-                                "inst_id": _worst_inst,
-                                "ord_id": close_ord,
-                                "pos_side": _worst_pos["pos_side"],
-                                "avg_px": _worst_pos["avg_px"],
-                                "size": _worst_pos["size"],
-                                "mark_px": _worst_pos["mark_px"],
-                                "upl": _worst_pos.get("upl", 0),
-                                "upl_ratio_pct": _worst_pos.get("upl_ratio_pct", 0),
-                                "c_time": _worst_pos.get("c_time", time.time()),
-                                "leverage": int(_worst_pos.get("leverage", 1)),
-                                "timestamp": time.time(),
-                                "signal_id": _worst_pos.get("signal_id", ""),
-                                "funding_rate": _worst_pos.get("funding_rate", _entry.funding_rate),
-                                "best_signal": _best_sig,
-                                "best_analysis": _entry.analysis,
-                                "best_coin": _coin_info,
-                                "best_regime": _entry.detected_regime,
-                                "best_funding_rate": _entry.funding_rate,
-                                "candles_4h": _entry.candles_by_tf.get("4H", []),
-                            }
-                            state_manager.state._pending_close = _pending_close
-                            state_manager.save()
-                            _switch_triggered = True
+                        # 修复 2026-08-10 (穿仓事故根因): 换仓平仓前 daily_loss 预检 —
+                        # 平仓 PnL 会把当日亏损推过上限时拒绝换仓, 避免
+                        # "先割肉、后开新仓被断路器拦截"的双输
+                        # (实测 PUMP→HOME: 平仓 -28.85 后新仓被 Breaker 拦截,
+                        # 亏损已发生却无新仓替代, 白吃一轮亏损)。
+                        # 用当前未实现盈亏近似平仓 PnL(扣预估手续费), 更保守。
+                        _dl_ok = True
+                        try:
+                            _ds_pre = float(state_manager.state.daily_start_equity or 0)
+                            _mll_pre = _ds_pre * float(
+                                risk_cfg.get("max_daily_loss_pct", 10.0) or 0) / 100.0
+                        except (TypeError, ValueError):
+                            _mll_pre = 0.0
+                        _est_close_pnl = float(_worst_pos.get("upl", 0) or 0)
+                        if _mll_pre > 0 and _est_close_pnl < 0:
+                            try:
+                                _est_fee_pre = _estimate_fee_cost(
+                                    client, _worst_inst,
+                                    _worst_pos["size"], _worst_pos["avg_px"],
+                                )
+                            except Exception:
+                                _est_fee_pre = 0.0
+                            _est_close_pnl -= _est_fee_pre
+                            if state_manager.state.daily_loss + _est_close_pnl <= -_mll_pre:
+                                _dl_ok = False
+                                logger.warning(
+                                    f"[Switch] 拒绝换仓: 平仓预估 PnL {_est_close_pnl:.2f} "
+                                    f"将使 daily_loss {state_manager.state.daily_loss:.2f} "
+                                    f"跌破上限 {-_mll_pre:.2f}，维持持仓 {_worst_inst}"
+                                )
+                        if _dl_ok:
+                            # 在 risk_gate 之前关闭旧仓位
                             logger.info(
-                                f"[Switch] 平仓已提交 {_worst_inst} (ord={close_ord})，"
-                                f"等待下一轮确认后开新仓 {_entry.inst_id}"
+                                f"[Switch] active_count={active_count}>={risk_cfg['max_positions']}, "
+                                f"预换仓: {_worst_inst} → {_entry.inst_id} "
+                                f"(score={_best_sig.score:.2f})"
                             )
+                            close_ord, _is_limit = client.close_position_safe(
+                                inst_id=_worst_inst,
+                                pos_side=_worst_pos["pos_side"],
+                                pos_size=_worst_pos["size"],
+                                mgn_mode=risk_cfg["margin_mode"],
+                            )
+                            if close_ord:
+                                if paper_engine is not None:
+                                    paper_engine.close_position(_worst_inst, reason="switch")
+                                _pending_close = {
+                                    "inst_id": _worst_inst,
+                                    "ord_id": close_ord,
+                                    "pos_side": _worst_pos["pos_side"],
+                                    "avg_px": _worst_pos["avg_px"],
+                                    "size": _worst_pos["size"],
+                                    "mark_px": _worst_pos["mark_px"],
+                                    "upl": _worst_pos.get("upl", 0),
+                                    "upl_ratio_pct": _worst_pos.get("upl_ratio_pct", 0),
+                                    "c_time": _worst_pos.get("c_time", time.time()),
+                                    "leverage": int(_worst_pos.get("leverage", 1)),
+                                    "timestamp": time.time(),
+                                    "signal_id": _worst_pos.get("signal_id", ""),
+                                    "funding_rate": _worst_pos.get("funding_rate", _entry.funding_rate),
+                                    "best_signal": _best_sig,
+                                    "best_analysis": _entry.analysis,
+                                    "best_coin": _coin_info,
+                                    "best_regime": _entry.detected_regime,
+                                    "best_funding_rate": _entry.funding_rate,
+                                    "candles_4h": _entry.candles_by_tf.get("4H", []),
+                                }
+                                state_manager.state._pending_close = _pending_close
+                                state_manager.save()
+                                _switch_triggered = True
+                                logger.info(
+                                    f"[Switch] 平仓已提交 {_worst_inst} (ord={close_ord})，"
+                                    f"等待下一轮确认后开新仓 {_entry.inst_id}"
+                                )
 
         if _switch_triggered:
             # 换仓已触发，跳过本轮后续步骤

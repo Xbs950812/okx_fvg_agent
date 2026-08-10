@@ -614,20 +614,50 @@ class PaperTradingEngine:
             except (TypeError, ValueError):
                 hi = lo = None
 
-        # 1. 止损（含滑点）
-        # 修复: 判定必须结合实时 mark 价——REST candles 仅含已收盘 K 线，
-        # 实时价可能已触及止损却因 K 线滞后未触发
+        # 1. 止损（含滑点）+ 强平模拟 (2026-08-10 穿仓事故修复)
+        # 修复 1: 判定必须结合实时 mark 价——REST candles 仅含已收盘 K 线，
+        # 实时价可能已触及止损却因 K 线滞后未触发。
+        # 修复 2: 高杠杆(50x)持仓价格跌 2% 保证金即耗尽, 真实交易所会在
+        # 理论爆仓点强平, 只损失保证金。原实现无强平模拟, 让 SL(-5%) 在
+        # 爆仓点之后才结算, 单笔亏损超过保证金导致账户穿仓
+        # (实测 PUMP 换仓 PnL=-28.85, 保证金仅 11.40, 余额 25.54 → -3.31)。
+        # 取止损触发价与理论爆仓价中更近 entry 者优先触发(跳空时止损优先,
+        # 正常下跌时爆仓点先到则强平), 保证任何路径亏损 ≤ 保证金。
+        # 注意: 滑点只影响成交价, 不提前触发判定 (与旧止损语义一致)。
+        _liq_px = None
+        try:
+            _lev = max(1.0, float(pos.leverage or 1))
+        except (TypeError, ValueError):
+            _lev = 1.0
         if pos.side == "long":
-            if (lo is not None and lo <= pos.sl_px) or \
-                    (mark is not None and mark <= pos.sl_px):
+            if _lev > 1.0 and pos.entry_px > 0:
+                _liq_px = pos.entry_px * (1.0 - 1.0 / _lev)
+                _trigger = max(pos.sl_px, _liq_px)
+                _is_liq = _trigger == _liq_px
+            else:
+                _trigger = pos.sl_px
+                _is_liq = False
+            if (lo is not None and lo <= _trigger) or \
+                    (mark is not None and mark <= _trigger):
+                if _is_liq:
+                    return _trigger, "liquidation"
                 return pos.sl_px * (1 - _SL_SLIPPAGE), "stop_loss"
             # 2. 止盈（与止损同根 K 线同时触发时已按止损处理，保守）
             if (hi is not None and hi >= pos.tp_px) or \
                     (mark is not None and mark >= pos.tp_px):
                 return pos.tp_px, "take_profit"
         elif pos.side == "short":
-            if (hi is not None and hi >= pos.sl_px) or \
-                    (mark is not None and mark >= pos.sl_px):
+            if _lev > 1.0 and pos.entry_px > 0:
+                _liq_px = pos.entry_px * (1.0 + 1.0 / _lev)
+                _trigger = min(pos.sl_px, _liq_px)
+                _is_liq = _trigger == _liq_px
+            else:
+                _trigger = pos.sl_px
+                _is_liq = False
+            if (hi is not None and hi >= _trigger) or \
+                    (mark is not None and mark >= _trigger):
+                if _is_liq:
+                    return _trigger, "liquidation"
                 return pos.sl_px * (1 + _SL_SLIPPAGE), "stop_loss"
             # 2. 止盈（与止损同根 K 线同时触发时已按止损处理，保守）
             if (lo is not None and lo <= pos.tp_px) or \
@@ -781,6 +811,11 @@ class PaperTradingEngine:
         else:
             gross = pos.size * pos.ct_val * (pos.entry_px - exit_px)
         exit_fee = notional_exit * self.taker_fee
+        # 强平兜底 (2026-08-10 穿仓事故修复): 理论爆仓点结算 gross ≈ -margin,
+        # 因滑点/跳空可能略超, 封顶在保证金(真实强平最多损失全部保证金),
+        # 手续费仍照扣, 防止余额穿仓变负。
+        if reason == "liquidation":
+            gross = max(gross, -pos.margin)
         net = gross - exit_fee
         self.balance += net
         self._last_close_pnl = net

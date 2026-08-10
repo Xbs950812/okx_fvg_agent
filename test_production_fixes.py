@@ -632,6 +632,120 @@ def test_paper_update_sl_tighten_only():
             "未成交挂单不得被 CE 抬止损影响"
 
 
+def test_paper_liquidation_caps_loss_at_margin():
+    """纸面强平模拟 (2026-08-10 穿仓事故修复): 50x 持仓价格触及理论爆仓点
+    (亏损=保证金) 即强平, 亏损封顶在保证金, 余额不为负。
+
+    回归: 无强平模拟时 SL(-5%) 在爆仓点(-2%)之后才结算, 单笔亏损 -28.85
+    超过保证金 11.40, 余额 25.54 → -3.31 穿仓。
+    """
+    from paper_trading import PaperTradingEngine
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "maker_fee": 0.0002, "taker_fee": 0.0005,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 0, "max_positions": 1,
+                     "max_hold_hours": 48},
+            "optimization": {},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=95.0, tp=110.0, leverage=50)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True
+        assert pos.leverage == 50
+        # 理论爆仓点 = entry × (1-1/50) = 98.0; SL=95 在爆仓点之下(更远)
+        # mark=97.5 已破爆仓点 → 应强平而非等 SL
+        eng.set_market_data_provider(lambda inst: eng._cached_md.get(inst))
+        eng._cached_md["BTC-USDT-SWAP"] = {"mark": 97.5, "candles": []}
+        eng.update()
+        assert "BTC-USDT-SWAP" not in eng._positions, "破爆仓点应强平"
+        trade = eng._trades[-1]
+        assert trade["reason"] == "liquidation", f"应为强平, 实际 {trade['reason']}"
+        assert trade["exit_px"] == 98.0, f"强平价应为理论爆仓点 98.0, 实际 {trade['exit_px']}"
+        # 亏损封顶: 本金亏损 ≤ margin, 另扣手续费
+        assert trade["pnl"] >= -pos.margin - 1.0, \
+            f"亏损应封顶在保证金附近, pnl={trade['pnl']} margin={pos.margin}"
+        assert eng.balance >= 0, f"余额不得穿仓变负, 实际 {eng.balance}"
+
+
+def test_paper_stop_loss_precedes_liquidation():
+    """SL 比爆仓点更近时正常止损, 不强平 (2026-08-10):
+    entry=100, lev=50 → 爆仓点 98(-2%); SL=99(-1%) 更近 →
+    价格跌到 98.5 触发 stop_loss, 损失 1% 远小于保证金。
+    """
+    from paper_trading import PaperTradingEngine
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "maker_fee": 0.0002, "taker_fee": 0.0005,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 0, "max_positions": 1,
+                     "max_hold_hours": 48},
+            "optimization": {},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=99.0, tp=110.0, leverage=50)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True
+        eng.set_market_data_provider(lambda inst: eng._cached_md.get(inst))
+        # mark=98.5: 低于 SL 99 但高于爆仓点 98 → 止损优先
+        eng._cached_md["BTC-USDT-SWAP"] = {"mark": 98.5, "candles": []}
+        eng.update()
+        assert "BTC-USDT-SWAP" not in eng._positions, "触及 SL 应平仓"
+        trade = eng._trades[-1]
+        assert trade["reason"] == "stop_loss", f"应为止损, 实际 {trade['reason']}"
+        # 止损价含滑点: 99 × 0.995 = 98.505
+        assert abs(trade["exit_px"] - 99.0 * 0.995) < 1e-6, \
+            f"止损执行价错误: {trade['exit_px']}"
+        # 损失 = 1% × 名义, 远小于保证金, 不应触发强平封顶
+        assert trade["pnl"] > -pos.margin, \
+            f"止损损失应远小于保证金, pnl={trade['pnl']} margin={pos.margin}"
+
+
+def test_paper_liquidation_gap_prefers_stop_loss():
+    """跳空场景: 一根 K 线同时穿过 SL 与爆仓点时, 取更近 entry 的 SL 优先
+    (2026-08-10 强平模拟): 避免跳空时误判为强平多亏。
+    entry=100, lev=50 → 爆仓 98; SL=99(-1%); lo=97 同时穿破两者 → 止损优先。
+    """
+    from paper_trading import PaperTradingEngine
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {
+            "paper": {"enabled": True, "balance": 100.0,
+                      "maker_fee": 0.0002, "taker_fee": 0.0005,
+                      "state_file": os.path.join(td, "paper_state.json")},
+            "risk": {"position_sizing": "margin", "margin_pct": 30.0,
+                     "risk_per_trade_pct": 1.0, "enforce_risk_cap": True,
+                     "max_position_leverage": 0, "max_positions": 1,
+                     "max_hold_hours": 48},
+            "optimization": {},
+        }
+        eng = PaperTradingEngine(cfg)
+        signal = _make_signal(entry=100.0, sl=99.0, tp=110.0, leverage=50)
+        instrument_info = {"ctVal": "0.01", "minSz": "1", "lotSz": "1"}
+        eng.open_position(signal, instrument_info, cfg["risk"], equity=100.0)
+        pos = eng._positions["BTC-USDT-SWAP"]
+        pos.filled = True
+        eng.set_market_data_provider(lambda inst: eng._cached_md.get(inst))
+        # 用 Candle 构造低点 97 (同根 K 线穿破 SL 99 和爆仓 98)
+        candle = Candle(timestamp=1, open=99.5, high=99.8, low=97.0,
+                        close=97.5, volume=10)
+        eng._cached_md["BTC-USDT-SWAP"] = {"mark": 97.5, "candles": [candle]}
+        eng.update()
+        assert "BTC-USDT-SWAP" not in eng._positions
+        trade = eng._trades[-1]
+        assert trade["reason"] == "stop_loss", \
+            f"跳空应优先止损(更近 entry), 实际 {trade['reason']}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
