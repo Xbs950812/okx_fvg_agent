@@ -12,7 +12,13 @@
     "_demo_comment": "将 demo 设为 true 启用模拟交易。需要先在 OKX App → 模拟交易 → API 创建模拟交易 API 密钥",
     "demo_api_key": "YOUR_DEMO_API_KEY",
     "demo_api_secret": "YOUR_DEMO_API_SECRET",
-    "demo_passphrase": "YOUR_DEMO_PASSPHRASE"
+    "demo_passphrase": "YOUR_DEMO_PASSPHRASE",
+    "rate_limit": {
+      "enabled": true,
+      "max_qps": 10,
+      "burst_capacity": 20,
+      "_comment": "全局 API 限流令牌桶: 主动控制请求 QPS 避免 429 降权。dry_run 模拟盘不启用"
+    }
   },
   "strategy": {
     "timeframes": ["1H", "4H"],
@@ -113,7 +119,32 @@
     "profit_withdrawal_pct": 25,
     "max_positions": 1,
     "max_daily_loss_pct": 10,
-    "max_exposure_pct": 30
+    "max_exposure_pct": 30,
+    "max_daily_trades": 0,
+    "_max_daily_trades_comment": "每日最大平仓笔数上限(防换仓绞肉机过度交易): 0=不限制",
+    "rolling_kelly": {
+      "enabled": true,
+      "window": 100,
+      "min_samples": 10,
+      "sample_full_kelly": 50,
+      "min_risk_pct": 1.0,
+      "max_risk_pct": 0,
+      "ewma_lambda": 0.97,
+      "_comment": "滚动Kelly风险上限(2026-08-15 翻倍协议): 从recent_pnl滚动计算分数Kelly作为单笔风险上限, eff_risk=min(自适应, Kelly)。样本<50笔用1/4 Kelly(探索档), >=50笔用1/2 Kelly(利用档)。window=滚动窗口笔数; min_samples=低于此样本数不施加约束; max_risk_pct=0表示用risk_per_trade_pct作上限; ewma_lambda=输入端指数加权平滑(主流实践), 消除窗口边界驱逐跳变+加快体制切换响应, <=0关闭回退平权窗口"
+    },
+    "order_book_depth": {
+      "enabled": true,
+      "max_notional_depth_ratio": 0.05,
+      "depth_levels": 10,
+      "_comment": "开仓前流动性检查: 名义仓位不得超过对侧前N档深度的该比例(5%)"
+    },
+    "vol_targeting": {
+      "enabled": true,
+      "target_vol_pct": 2.0,
+      "min_scale": 0.5,
+      "max_scale": 1.5,
+      "_comment": "波动率目标仓位: ATR%偏离target时缩放margin_pct, 裁剪到[min_scale,max_scale]"
+    }
   },
   "memory": {
     "enabled": true,
@@ -222,6 +253,12 @@
     "log_level": "INFO",
     "log_file": "agent.log",
     "aggressiveness": 3,
-    "_aggressiveness_comment": "研判挡位: 1=激进(每天必找一币), 2=均衡(2-3天一笔), 3=保守(默认)"
+    "_aggressiveness_comment": "研判挡位: 1=激进(每天必找一币), 2=均衡(2-3天一笔), 3=保守(默认)",
+    "reconciliation": {
+      "startup_enabled": true,
+      "funding_fee_enabled": true,
+      "funding_fee_interval_rounds": 6,
+      "_comment": "启动三方对账(持仓↔本地状态↔保护单) + 资金费率实际对账(每N轮, 仅持仓时)"
+    }
   }
 }

@@ -26,6 +26,8 @@ agent_state.json.tmp
 paper_state.json
 paper_state.json.bak
 test_paper_state.json
+night_watch_state.json
+night_watch_state.json.bak
 
 # 运行时产物目录
 memory/

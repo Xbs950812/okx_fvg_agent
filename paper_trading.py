@@ -186,10 +186,14 @@ class PaperTradingEngine:
         self.maker_fee: float = float(pcfg.get("maker_fee", _DEFAULT_MAKER_FEE))
         self.taker_fee: float = float(pcfg.get("taker_fee", _DEFAULT_TAKER_FEE))
         self.limit_timeout_s: float = float(pcfg.get("limit_timeout_min", 15)) * 60.0
-        # 成交加速兜底(纸面测试用): 限价单挂单超过 fill_assist_seconds 仍未成交时，
-        # 按当前标记价模拟市价成交，保证能测到完整交易闭环(开仓→保护→追踪→平仓)。
-        # 0 表示关闭该兜底，仅靠自然回补成交。
+        # 挂单观察期 (2026-08-11 重构): fill_assist_seconds 语义从"强成交加速"
+        # 改为"回补无望判定"——挂单超过该秒数后检查 mark 与挂单价偏离, 偏离超
+        # fill_assist_deviation_pct 则直接撤单放弃(不成交), 不再模拟市价追单
+        # (曾致 NEIRO +11.85%/LAB#1 -3.89% 追价成交, 入场价失真污染测试数据)。
+        # 0 = 关闭观察期判定, 仅靠 limit_timeout_s 超时取消。
         self.fill_assist_s: float = float(pcfg.get("fill_assist_seconds", 0))
+        self.fill_assist_deviation_pct: float = float(
+            pcfg.get("fill_assist_deviation_pct", 3.0) or 3.0)
         # 纸面移动止损(2026-08-08 补齐): 与实盘 optimization.TrailingStop 同参 —
         # 激活阈值/追踪距离基于 ATR 动态计算, 无 ATR 时回退固定百分比。
         ocfg = config.get("optimization", {}) if isinstance(config, dict) else {}
@@ -218,6 +222,12 @@ class PaperTradingEngine:
         self._market_data_fn: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
         self._cached_md: Dict[str, Dict[str, Any]] = {}
         self._last_close_pnl: Optional[float] = None
+        # 平仓事件队列 (2026-08-11 风控修复): 每次完整/部分平仓(止损/止盈/换仓/
+        # 时间/ROI/减仓) append 一条 trade 记录, 由主循环 consume_close_events()
+        # 喂入 edge_analyzer, 保证纸面模式的止损/止盈等被动退出也能触发
+        # adaptive_tuner 连亏暂停/回撤断路器(此前仅主动平仓走 _pending_close
+        # 确认路径, 止损被 _close_locked 内部结算后 edge_analyzer.trades 永空)。
+        self._close_events: List[Dict[str, Any]] = []
         self._start_time: float = time.time()
 
     # ------------------------------------------------------------------
@@ -331,12 +341,14 @@ class PaperTradingEngine:
                     f"[Paper] {inst_id} 深挂 conditional 触发单 "
                     f"{signal.position_side.upper()} trigger={pos.trigger_px:.6g} "
                     f"entry={signal.entry_price:.6g} size={sz}")
+            _margin_target = equity * float(risk_cfg.get("margin_pct", 30.0)) / 100.0
             logger.info(
                 f"[Paper] {inst_id} 纸面限价挂单 {signal.position_side.upper()} "
                 f"@{signal.entry_price:.6g} size={sz} "
                 f"tp={signal.take_profit:.6g} sl={signal.stop_loss:.6g} "
-                f"equity={equity:.2f} leverage={pos.leverage:.0f}x "
-                f"margin={margin:.2f} notional={pos.size * pos.ct_val * pos.entry_px:.2f}")
+                f"equity={equity:.2f} (30%={_margin_target:.2f}) "
+                f"leverage={pos.leverage:.0f}x margin={margin:.2f} "
+                f"notional={pos.size * pos.ct_val * pos.entry_px:.2f}")
             self.save()
             return f"paper_open_{int(time.time() * 1000)}"
 
@@ -436,12 +448,24 @@ class PaperTradingEngine:
                         (mark is not None and mark >= pos.entry_px):
                     self._fill_locked(pos, md)
                     return
-        # 成交加速兜底: 超过 fill_assist_s 仍未成交且能取到标记价时，
-        # 按标记价模拟市价成交（纸面测试专用，实盘不受影响）。
+        # 回补无望判定 (2026-08-11): 挂单超过观察期仍未成交时, 若实时 mark
+        # 已偏离挂单价超过阈值(=价格远离回补位), 直接撤单放弃而非强成交。
+        # 原实现按 mark 模拟市价成交(曾致 NEIRO 追高 +11.85% 入场, TP/SL
+        # 等比重算后结构恶化), 已移除 — 与实盘"限价等回补/超时撤单"口径一致。
         if self.fill_assist_s > 0 and now - pos.open_time > self.fill_assist_s:
             if mark is not None:
-                self._fill_locked(pos, md, assist=True)
-                return
+                _dev = abs(mark - pos.entry_px) / pos.entry_px * 100.0
+                if _dev > self.fill_assist_deviation_pct:
+                    del self._positions[pos.inst_id]
+                    logger.info(
+                        f"[Paper] {pos.inst_id} 挂单 {pos.entry_px:.6g} 超观察期 "
+                        f"且偏离现价 {_dev:.2f}% > {self.fill_assist_deviation_pct:.1f}%，"
+                        f"回补无望，撤单放弃(不追价)")
+                    return
+                # 偏离在阈值内: 价格仍在回补位附近, 继续等待自然回补
+                logger.debug(
+                    f"[Paper] {pos.inst_id} 挂单超观察期但偏离 {_dev:.2f}% "
+                    f"≤ {self.fill_assist_deviation_pct:.1f}%，继续等回补")
         # 超时取消（与实盘限价单超时口径一致）
         # 修复: 用 >= 而非 > — 当 limit_timeout_s=0(测试/即时超时) 且
         # open 与 update 发生在同一时钟 tick 时，now-open_time==0.0，
@@ -553,42 +577,21 @@ class PaperTradingEngine:
                         f"[Paper] {inst_id} 止损同步下移 → {new_sl:.6g}")
             self.save()
 
-    def _fill_locked(self, pos: PaperPosition, md: Dict[str, Any],
-                     assist: bool = False) -> None:
-        """限价单成交；assist=True 为成交加速兜底(按标记价模拟市价成交)。
+    def _fill_locked(self, pos: PaperPosition, md: Dict[str, Any]) -> None:
+        """限价单成交（按挂单价；价格触及挂单价或更好价才成交，绝不追价）。
 
-        修复: assist 成交价偏离挂单价时，TP/SL 必须按新成交价等比重算，
-        否则 RR 严重缩水（实测 HOME: 挂单 RR=2.50 → 兜底成交 @+2.5%
-        TP/SL 未动 → RR=1.09，等于把高质量信号开成了低质量仓位）。
+        2026-08-11: 已移除 assist 强成交路径（按 mark 模拟市价成交 + TP/SL
+        等比重算），该路径曾致 NEIRO +11.85% / LAB#1 -3.89% 追价入场。
         """
         pos.filled = True
         fill_px = pos.entry_px
-        if assist and md.get("mark") is not None:
-            fill_px = float(md["mark"])
-            _orig_entry = pos.entry_px
-            # 等比重算 TP/SL: 保持 |TP-entry|/entry 与 |SL-entry|/entry 不变
-            if _orig_entry > 0 and abs(fill_px - _orig_entry) / _orig_entry > 1e-6:
-                _tp_dist = abs(pos.tp_px - _orig_entry) / _orig_entry
-                _sl_dist = abs(pos.sl_px - _orig_entry) / _orig_entry
-                if pos.side == "long":
-                    pos.tp_px = fill_px * (1 + _tp_dist)
-                    pos.sl_px = fill_px * (1 - _sl_dist)
-                else:
-                    pos.tp_px = fill_px * (1 - _tp_dist)
-                    pos.sl_px = fill_px * (1 + _sl_dist)
-                logger.info(
-                    f"[Paper] {pos.inst_id} 兜底成交偏离 "
-                    f"{abs(fill_px - _orig_entry) / _orig_entry:.2%}，"
-                    f"TP/SL 等比重算: tp={pos.tp_px:.6g} sl={pos.sl_px:.6g}")
-            pos.entry_px = fill_px
         notional = pos.size * pos.ct_val * fill_px
         pos.entry_fee = notional * self.maker_fee
         self.balance -= pos.entry_fee
         if md.get("mark") is not None:
             pos.last_mark = float(md["mark"])
         logger.info(
-            f"[Paper] {pos.inst_id} "
-            f"{'成交加速兜底' if assist else '限价单成交'} @ {fill_px:.6g} "
+            f"[Paper] {pos.inst_id} 限价单成交 @ {fill_px:.6g} "
             f"size={pos.size} 手续费-{pos.entry_fee:.4f}")
 
     # ------------------------------------------------------------------
@@ -790,6 +793,7 @@ class PaperTradingEngine:
                 "partial": True,
             }
             self._trades.append(trade)
+            self._close_events.append(trade)
             # 剩余仓位按比例缩减 margin（size 与 margin 同步缩小）
             if remain_size > 0:
                 pos.size = remain_size
@@ -837,6 +841,7 @@ class PaperTradingEngine:
             "signal_id": pos.signal_id,
         }
         self._trades.append(trade)
+        self._close_events.append(trade)
         del self._positions[pos.inst_id]
         logger.info(
             f"[Paper] 平仓 {pos.inst_id} {reason} @ {exit_px:.6g} "
@@ -849,6 +854,19 @@ class PaperTradingEngine:
             v = self._last_close_pnl
             self._last_close_pnl = None
             return v
+
+    def consume_close_events(self) -> List[Dict[str, Any]]:
+        """取走自上次调用以来发生的全部平仓事件（止损/止盈/换仓/时间/ROI/减仓）。
+
+        供主循环每轮喂入 edge_analyzer：`_close_locked` 与 `scale_out` 均
+        append 事件，覆盖被动退出（此前不经过 _pending_close 确认路径，
+        edge_analyzer 收不到导致连亏暂停/回撤断路器失效）与主动平仓
+        （由本机制统一记录，主循环确认分支跳过重复 add_trade）。
+        """
+        with self._lock:
+            evs = self._close_events
+            self._close_events = []
+            return evs
 
     # ------------------------------------------------------------------
     # 查询接口

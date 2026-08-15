@@ -47,6 +47,7 @@ class AgentState:
     daily_loss: float = 0.0              # 当日累计亏损（ equity - daily_start_equity，≤0）
     daily_date: str = ""                 # 当日日期 (YYYY-MM-DD)
     daily_start_equity: float = 0.0      # 当日开盘权益（用于计算实际日内盈亏）
+    daily_trades: int = 0                # 当日已平仓交易笔数 (2026-08-14 防过度交易)
     active_signals: Dict[str, dict] = field(default_factory=dict)  # 活跃信号 {inst_id: position_info}
     _pending_close: Optional[dict] = None  # 非阻塞平仓待确认状态 {inst_id, ord_id, ...}
     pending_close_meta: Optional[dict] = None  # 修复 P0-D: _pending_close 的可序列化元数据，
@@ -54,6 +55,7 @@ class AgentState:
     # 重启后据此重建 _pending_close，续跑平仓确认 → 已实现盈亏/日亏限额不丢。
     trailing_stop_state: Dict[str, float] = field(default_factory=dict)  # 追踪止损高水位线持久化 {inst_id: highest_price}
     recent_pnl: List[float] = field(default_factory=list)  # 近 N 笔已实现盈亏(期望值门禁用, 2026-08-07)
+    slippage_samples: List[float] = field(default_factory=list)  # 实际滑点样本 %(2026-08-14 回填闭环)
     ev_degrade_until: float = 0.0  # 期望值降频冷却截止时间戳(负期望时降频而非硬暂停, 2026-08-07)
 
 
@@ -179,6 +181,7 @@ class StateManager:
             self.state.daily_loss = 0.0
             self.state.daily_date = today
             self.state.daily_start_equity = equity
+            self.state.daily_trades = 0  # 跨日重置当日交易笔数 (2026-08-14)
         elif self.state.daily_start_equity <= 0 and equity > 0:
             # 首次运行或旧状态文件无此字段时补设
             self.state.daily_start_equity = equity
@@ -225,6 +228,7 @@ class StateManager:
         # 现在: 直接累加，正负均可，最终检查 daily_loss 是否低于 -max_daily_loss
         self.state.daily_loss += pnl
         self.state.realized_pnl += pnl
+        self.state.daily_trades += 1  # 当日交易笔数 (2026-08-14 防过度交易)
         # 滚动已实现盈亏列表(期望值门禁用): 保留最近 100 笔
         self.state.recent_pnl.append(pnl)
         if len(self.state.recent_pnl) > 100:
@@ -236,6 +240,30 @@ class StateManager:
         else:
             self.state.break_even_trades += 1
         self.state.positions_closed += 1
+
+    def record_slippage(self, intended_px: float, actual_px: float):
+        """记录一笔平仓的实际滑点 %（2026-08-14 回填闭环）。
+
+        正数表示成交价劣于意图价（滑点损失），负数表示优于（成交价更好）。
+        保留最近 50 个样本，供后续校准成本模型/收紧挂单距离。
+
+        Args:
+            intended_px: 意图成交价（如限价挂单价或 mark 参考价）
+            actual_px: 实际成交价
+        """
+        if intended_px is None or actual_px is None:
+            return
+        try:
+            _ipx = float(intended_px)
+            _apx = float(actual_px)
+            if _ipx <= 0 or _apx <= 0:
+                return
+            _slip = (_apx - _ipx) / _ipx * 100.0
+            self.state.slippage_samples.append(_slip)
+            if len(self.state.slippage_samples) > 50:
+                self.state.slippage_samples = self.state.slippage_samples[-50:]
+        except (TypeError, ValueError, ZeroDivisionError):
+            return
 
     def get_win_rate(self) -> float:
         """计算胜率（剔除保本交易，避免失真）。
@@ -351,6 +379,59 @@ def calculate_position_size(
         return 0.0, 0.0
 
     return sz, margin
+
+
+def check_order_book_liquidity(
+    client,
+    inst_id: str,
+    pos_side: str,
+    notional_usd: float,
+    ct_val: float,
+    config: dict,
+) -> Tuple[bool, str]:
+    """开仓前订单簿深度/流动性检查 (2026-08-14 顶级交易所实践)。
+
+    名义仓位相对前 N 档对侧深度过大时，平仓市价兜底会吃掉多档、滑点
+    远超成本模型估算（尤其涨跌幅榜中盘小币订单簿薄）。对侧含义:
+      - 做多(long) → 平仓时卖出吃 bids 深度
+      - 做空(short) → 平仓时买入吃 asks 深度
+
+    门槛: notional / 对侧深度 > max_notional_depth_ratio → 拒绝开仓。
+    默认 5%（名义仓位不得超过对侧前 N 档深度的 5%），保守起见超限直接
+    拒绝而非降仓（降仓会让风控口径与满倍率模式不一致）。
+
+    查询失败返回 ok=True（fail-open，不阻塞开仓）——流动性检查是增强
+    门，不是核心风控闸；订单簿偶发不可得时不应让账户空转。
+
+    Returns:
+        (ok, reason) — ok=False 表示流动性不足，应拒绝开仓
+    """
+    _ob_cfg = (config.get("risk", {}) or {}).get("order_book_depth", {}) or {}
+    if not _ob_cfg.get("enabled", True):
+        return True, ""
+    _max_ratio = float(_ob_cfg.get("max_notional_depth_ratio", 0.05) or 0)
+    _levels = int(_ob_cfg.get("depth_levels", 10) or 10)
+    if _max_ratio <= 0 or notional_usd <= 0:
+        return True, ""
+    try:
+        _depth = client.get_order_book_depth_usd(
+            inst_id, levels=_levels, ct_val=ct_val)
+    except Exception as _e:
+        logger.warning(f"[Liquidity] {inst_id} 订单簿深度查询失败，放行: {_e}")
+        return True, ""
+    if not _depth:
+        return True, ""
+    _side_depth = (_depth.get("bids_usd", 0.0) if pos_side == "long"
+                   else _depth.get("asks_usd", 0.0))
+    if _side_depth <= 0:
+        return True, ""
+    _ratio = notional_usd / _side_depth
+    if _ratio > _max_ratio:
+        return False, (
+            f"[Liquidity] {inst_id} 名义 {notional_usd:.2f} USDT / 对侧前 "
+            f"{_levels} 档深度 {_side_depth:.2f} USDT = {_ratio:.1%} "
+            f"> {_max_ratio:.0%}，订单簿过薄，拒绝开仓")
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +633,16 @@ def execute_signal(
         side = "sell"
         pos_side = "short"
 
+    # ---- 开仓前订单簿深度/流动性检查 (2026-08-14 顶级交易所实践) ----
+    # 名义仓位相对对侧前 N 档深度比例过大 → 订单簿过薄，平仓滑点远超估算。
+    # 放在计算完 sz/notional 之后、下单之前，覆盖直接开仓与换仓/反手路径。
+    _notional_usd = float(sz) * float(ct_val) * float(signal.entry_price)
+    _liq_ok, _liq_reason = check_order_book_liquidity(
+        client, signal.inst_id, pos_side, _notional_usd, ct_val, config)
+    if not _liq_ok:
+        logger.info(_liq_reason)
+        return None
+
     # ---- 格式化价格精度 ----
     # OKX 要求价格和数量为字符串
     tick_sz = "0.1"
@@ -567,11 +658,16 @@ def execute_signal(
     sl_px = f"{signal.stop_loss:.{px_precision}f}"
     sz_str = f"{sz:.{sz_precision}f}"
 
+    # 开仓前仓位核对日志 (2026-08-11 用户要求): 打印保证金/杠杆/名义仓位，
+    # 便于核对是否按 "margin_pct% 余额做保证金 × 满倍杠杆" 执行。
+    _notional = float(sz) * float(ct_val) * float(signal.entry_price)
     logger.info(
         f"\n{'='*60}\n"
         f"  SIGNAL: {signal.inst_id} {signal.position_side.upper()}\n"
         f"  Entry:  {entry_px}  |  TP: {tp_px}  |  SL: {sl_px}\n"
-        f"  Size:   {sz_str}  |  Leverage: {signal.leverage}x  |  Margin: {margin:.2f}\n"
+        f"  Size:   {sz_str}  |  Leverage: {_eff_leverage}x\n"
+        f"  Margin: {margin:.2f} (equity {equity:.2f} × {risk_cfg.get('margin_pct', 30.0)}%)  "
+        f"|  Notional: {_notional:.2f}\n"
         f"  Score:  {signal.score:.2f}  |  {signal.reason}\n"
         f"{'='*60}"
     )

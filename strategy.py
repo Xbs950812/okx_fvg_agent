@@ -788,12 +788,18 @@ def _extreme_move_reject_reason(
 
     Returns:
         拒绝原因字符串 (含 ADX/ATR% 实测值) 或 None (放行)。
-        数据不足时 fail-open 放行 (防新币/数据缺失阻塞, 与 ATRGrade 同策略)。
+        数据不足时 fail-closed 拒绝 (防次新币 K 线不足绕过门禁直接开仓,
+        2026-08-13 加固)。
     """
     if min_adx <= 0 and min_atr_pct <= 0:
         return None  # 门禁关闭
-    if not candles or len(candles) < atr_period * 2:
-        return None  # fail-open: K线不足不做裁决
+    # 数据不足直接拒绝开仓 (2026-08-13 加固): 原 fail-open 放行会让次新币
+    # (4H K 线 < 阈值) 绕过 ExtremeMove 门禁。阈值对齐到 ADX 最小需求
+    # atr_period*2+1 根 (Wilder ADX 需 period*2+1 根才算得出), 同时消除
+    # 原 <atr_period*2 判断下 28 根时 ADX 返回 None、门禁静默失效的隐患。
+    if not candles or len(candles) < atr_period * 2 + 1:
+        return (f"数据不足({len(candles) if candles else 0}根 "
+                f"< {atr_period * 2 + 1}根)无法确认趋势强度，拒绝开仓")
     reasons = []
     _adx = _compute_adx(candles, period=atr_period)
     _adx_val = _adx[0] if _adx else None
@@ -1967,6 +1973,55 @@ def _detected_to_legacy(d: FVGDetected, candles: List[Candle]) -> FVG:
     )
 
 
+def _calc_24h_move_pct(
+    candles_by_tf: Dict[str, List[Candle]],
+    current_price: float,
+) -> Optional[float]:
+    """用 1H K 线估算 24h 涨跌幅 (%)，供方向-涨跌幅一致性门禁用。
+
+    与 executor.compute_movers 语义一致（24h 涨跌幅），但这里不依赖 ticker
+    的 open24h 字段，而是用 1H 收盘价回推 24h（约 24 根 1H K 线）。数据不足
+    (< 25 根) 返回 None，调用方 fail-open 不裁决。
+
+    Returns:
+        24h 涨跌幅 (%)；数据不足返回 None
+    """
+    candles_1h = (candles_by_tf or {}).get("1H") or []
+    if len(candles_1h) < 25 or current_price <= 0:
+        return None
+    try:
+        base = float(candles_1h[-25].close)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if base <= 0:
+        return None
+    return (current_price - base) / base * 100.0
+
+
+def _mover_direction_blocked(
+    position_side: str,
+    move_pct: Optional[float],
+    threshold_pct: float,
+) -> Optional[str]:
+    """方向-涨跌幅一致性门禁 (2026-08-13 用户要求)。
+
+    超跌币(跌幅榜)禁止追空、暴涨币(涨幅榜)禁止追多 — 均值回归视角下，
+    单边急跌后追空极易被反弹扫损(BABY 做空 -0.41 实测)、单边急涨后追多
+    极易被回落扫损。FVG Hunter 是趋势跟随策略，此门禁在极端涨跌幅处
+    强制转为"不做逆向均值回归的牺牲品"。
+
+    Returns:
+        拒绝原因字符串 (含实测涨跌幅)；放行返回 None
+    """
+    if move_pct is None or threshold_pct <= 0:
+        return None
+    if position_side == "short" and move_pct < -threshold_pct:
+        return f"跌幅榜币 24h {move_pct:+.1f}% 超跌，禁追空"
+    if position_side == "long" and move_pct > threshold_pct:
+        return f"涨幅榜币 24h {move_pct:+.1f}% 暴涨，禁追多"
+    return None
+
+
 def scan_fvg_all_timeframes(
     inst_id: str,
     candles_by_tf: Dict[str, List[Candle]],
@@ -2137,6 +2192,24 @@ def scan_fvg_all_timeframes(
                 if _sig:
                     _sig.reason = f"iFVG反转{_ifvg.direction} " + _sig.reason
                     signals.append(_sig)
+
+    # ---- 方向-涨跌幅一致性门禁 (2026-08-13 用户要求) ----
+    # 超跌币禁追空 / 暴涨币禁追多。阈值复用 market_movers.min_move_pct(8%)，
+    # 与"极端波动币"判定口径一致。数据不足 fail-open 不裁决。
+    _mover_min_pct = float(
+        (config.get("market_movers", {}) or {}).get("min_move_pct", 8.0) or 8.0)
+    if _mover_min_pct > 0:
+        _move_pct = _calc_24h_move_pct(candles_by_tf, current_price)
+        _kept: List[Signal] = []
+        for _s in signals:
+            _blk = _mover_direction_blocked(_s.position_side, _move_pct, _mover_min_pct)
+            if _blk:
+                logger.info(
+                    f"[MoverDir] {inst_id} {_s.fvg.timeframe} "
+                    f"{_s.position_side} 被方向门禁否决: {_blk}")
+            else:
+                _kept.append(_s)
+        signals = _kept
 
     # H-4: 简易多周期融合 — 若 1H 和 4H 同时存在同方向 FVG，增强信号
     _has_1h_long = any(s.fvg.timeframe == "1H" and s.position_side == "long" for s in signals)

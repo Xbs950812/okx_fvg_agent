@@ -435,7 +435,7 @@ def _make_trend_candles(n=60):
 
 
 def test_extreme_move_gate():
-    """FVG Hunter 硬门禁 (2026-08-08): 横盘拒绝 / 极端放行 / 数据不足 fail-open。"""
+    """FVG Hunter 硬门禁 (2026-08-08): 横盘拒绝 / 极端放行 / 数据不足 fail-closed。"""
     from strategy import _extreme_move_reject_reason
     # 横盘震荡 (ADX 低) → 拒绝 (ATR%≈3% 达标, ADX 不达标)
     choppy = _make_choppy_candles()
@@ -446,12 +446,80 @@ def test_extreme_move_gate():
     last_px = 100.0 * (1.02 ** 59)
     r2 = _extreme_move_reject_reason(trend, last_px, 14, 25.0, 2.0)
     assert r2 is None, f"强趋势极端行情应放行, 实际 {r2!r}"
-    # 数据不足 → fail-open 放行 (防新币阻塞)
+    # 数据不足 → fail-closed 拒绝 (2026-08-13 加固: 防次新币绕过门禁)
     r3 = _extreme_move_reject_reason(_make_choppy_candles(10), 100.0, 14, 25.0, 2.0)
-    assert r3 is None, "K线不足应 fail-open 放行"
+    assert r3 is not None and "数据不足" in r3, f"K线不足应拒绝开仓, 实际 {r3!r}"
     # 门禁关闭 (0) → 恒放行
     r4 = _extreme_move_reject_reason(choppy, 100.0, 14, 0.0, 0.0)
     assert r4 is None, "门禁关闭时应放行"
+
+
+def test_mover_direction_gate():
+    """方向-涨跌幅一致性门禁 (2026-08-13): 超跌禁追空 / 暴涨禁追多。"""
+    from strategy import _calc_24h_move_pct, _mover_direction_blocked
+    # 超跌币(24h -20%) 做空 → 拒绝
+    r1 = _mover_direction_blocked("short", -20.0, 8.0)
+    assert r1 is not None and "禁追空" in r1, f"超跌追空应被拒, 实际 {r1!r}"
+    # 超跌币做多 → 放行 (抄底方向正确)
+    r2 = _mover_direction_blocked("long", -20.0, 8.0)
+    assert r2 is None, f"超跌做多应放行, 实际 {r2!r}"
+    # 暴涨币(24h +20%) 做多 → 拒绝
+    r3 = _mover_direction_blocked("long", 20.0, 8.0)
+    assert r3 is not None and "禁追多" in r3, f"暴涨追多应被拒, 实际 {r3!r}"
+    # 暴涨币做空 → 放行
+    r4 = _mover_direction_blocked("short", 20.0, 8.0)
+    assert r4 is None, f"暴涨做空应放行, 实际 {r4!r}"
+    # 阈值内(±8%内) 双向放行
+    assert _mover_direction_blocked("short", -7.9, 8.0) is None
+    assert _mover_direction_blocked("long", 7.9, 8.0) is None
+    # 数据不足 → fail-open 放行
+    assert _mover_direction_blocked("short", None, 8.0) is None
+    # 门禁关闭 (阈值<=0) → 恒放行
+    assert _mover_direction_blocked("short", -20.0, 0.0) is None
+    # _calc_24h_move_pct: 由 1H 收盘价回推 24h
+    candles = _make_choppy_candles(30)  # 30 根, 最后一根 close≈100
+    candles[-1] = Candle(timestamp=29, open=80, high=81, low=79, close=80, volume=10)
+    mv = _calc_24h_move_pct({"1H": candles}, 80.0)
+    # 24h 前 ≈ candles[-25].close, 现价 80 → 涨跌幅应接近 0 (基数也是 100)
+    assert mv is not None, "1H 数据充足应能算 24h 涨跌幅"
+    # 数据不足 (<25 根) → None
+    assert _calc_24h_move_pct({"1H": candles[:10]}, 80.0) is None
+    print("PASS test_mover_direction_gate")
+
+
+def test_mover_direction_gate_deep_drop():
+    """深度跌幅(>30%) 门禁端到端拦截 (2026-08-13 用户要求)。
+
+    构造真实 1H K 线场景: 24h 前(-25 根) close=100, 现价 68 → 跌幅 -32%。
+    验证 _calc_24h_move_pct 回推出 -32% 后, _mover_direction_blocked 正确
+    拦截做空信号(且放行做多抄底)。
+    """
+    from strategy import _calc_24h_move_pct, _mover_direction_blocked
+    candles = []
+    # 前 6 根(索引0~5) close=100, 保证 candles[-25](索引5) close=100 为 24h 基准
+    for i in range(6):
+        candles.append(Candle(timestamp=i, open=100.0, high=101.0,
+                              low=99.0, close=100.0, volume=10.0))
+    # 后 24 根: 99 → 68 单边暴跌 (模拟跌幅榜深度超跌币)
+    for i in range(24):
+        px = 99.0 - 31.0 * i / 23.0
+        candles.append(Candle(timestamp=6 + i, open=px * 1.01, high=px * 1.02,
+                              low=px * 0.98, close=px, volume=10.0))
+    assert len(candles) == 30
+
+    mv = _calc_24h_move_pct({"1H": candles}, 68.0)
+    assert mv is not None, "1H 数据充足应能算 24h 涨跌幅"
+    assert mv < -30.0, f"跌幅应 >30%, 实际 {mv:.2f}%"
+
+    # 深度超跌 → 做空被拦截 (核心断言)
+    r = _mover_direction_blocked("short", mv, 8.0)
+    assert r is not None and "禁追空" in r and "-3" in r, \
+        f"深度超跌做空应被拦截, 实际 {r!r}"
+
+    # 深度超跌 → 做多放行 (抄底方向正确)
+    r2 = _mover_direction_blocked("long", mv, 8.0)
+    assert r2 is None, f"深度超跌做多应放行, 实际 {r2!r}"
+    print("PASS test_mover_direction_gate_deep_drop")
 
 
 class _FakeAnalysis:

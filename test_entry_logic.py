@@ -136,7 +136,12 @@ def make_bullish_fvg(candles):
 
 
 def _signal_kwargs(fvg, current_price, candles):
-    """统一的 generate_signal 参数。"""
+    """统一的 generate_signal 参数。
+
+    entry_distance_atr_mult=0: 显式关闭 ATR 挂钩深度阈值 (2026-08-10 特性)，
+    保持本测试的原始契约 = 固定 max_entry_distance_pct(1.5%) 距离检查。
+    ATR 挂钩路径由 test_production_fixes.py::TestEntryDistanceAtrHook 覆盖。
+    """
     return dict(
         inst_id="TEST-USDT-SWAP", fvg=fvg, current_price=current_price,
         entry_depth_pct=0.15, fvg_target_pct=0.50, stop_buffer_pct=0.15,
@@ -144,6 +149,7 @@ def _signal_kwargs(fvg, current_price, candles):
         funding_confluence_min_abs=0.0003, funding_confluence_max_abs=0.001,
         liquidity_extension_pct=LIQ_EXT, liquidity_extension_min_pct=0.5,
         max_entry_distance_pct=MAX_ENTRY_DEV, min_risk_reward=MIN_RR,
+        entry_distance_atr_mult=0.0,
         swing_lookback_bars=8, pullback_lookback=8, max_tp_distance_pct=25.0,
         long_short_ratio=None,
         tech_params={
@@ -191,8 +197,13 @@ def run_signal_case(name, fvg, candles, current_price):
     return sig
 
 
-def test_paper_fill(sig, candles):
-    """纸面引擎成交链路(方向通用): 挂单 → 价格回补成交 → TP 触发平仓。"""
+def paper_fill_check(sig, candles):
+    """纸面引擎成交链路(方向通用): 挂单 → 价格回补成交 → TP 触发平仓。
+
+    注: 普通辅助函数（main() 以实参调用），非 pytest 测试 —
+    原名 test_paper_fill 会被 pytest 收集并把 sig/candles 当 fixture
+    解析，导致 'fixture not found' 收集错误（2026-08-15 修复）。
+    """
     log.info("=" * 70)
     log.info(f"纸面成交链路模拟 ({sig.position_side})")
     cfg = {
@@ -287,12 +298,22 @@ def main():
 
     # ===== 纸面成交链路: SHORT + LONG 各跑一遍 =====
     if sig_short is not None:
-        test_paper_fill(sig_short, candles)
+        paper_fill_check(sig_short, candles)
     if sig_long is not None:
-        test_paper_fill(sig_long, ucandles)
+        paper_fill_check(sig_long, ucandles)
 
     log.info("=" * 70)
     log.info("🎉 全部测试通过")
+
+
+def test_entry_logic_main():
+    """pytest 入口 (2026-08-15): 跑完整 main() 流程。
+
+    覆盖: SHORT 深挂信号 → 宽幅 FVG 拒绝 → LONG 回补信号 →
+    纸面引擎 挂单/回补成交/TP 平仓 双向链路。独立运行方式不变:
+    python test_entry_logic.py
+    """
+    main()
 
 
 if __name__ == "__main__":

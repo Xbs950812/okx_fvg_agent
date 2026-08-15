@@ -12,6 +12,7 @@ OKX API v5 Client — 基于官方 python-okx SDK (v0.4.3) 封装。
 import json
 import logging
 import math
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -50,6 +51,45 @@ class OKXQueryError(Exception):
 _RETRYABLE_CODES = {"50011", "50012", "50013", "50000"}
 _RETRY_DELAYS = (0.5, 1.5, 4.0)
 
+# 全局 API 限流令牌桶（由 OKXClient 初始化，模块级共享给 _call_sdk_retry）。
+# 0 表示未启用（dry_run 或未配置时不限流）。
+_GLOBAL_RATE_LIMITER: Optional["_TokenBucket"] = None
+
+
+class _TokenBucket:
+    """全局 API 限流令牌桶 (2026-08-14 顶级交易所实践)。
+
+    主动控制请求频率，避免触发 OKX 429 限流被降权。与 _call_sdk_retry
+    的被动重试互补：令牌桶在源头削峰，重试兜底偶发失败。
+
+    算法: 经典令牌桶，capacity 为突发容量，rate 为每秒补充令牌数。
+    acquire() 无令牌时阻塞等待，保证 QPS 不超过配置值。
+    """
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = max(0.1, float(rate))
+        self.capacity = max(1.0, float(capacity))
+        self._tokens = self.capacity
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        """获取一个令牌（无令牌时阻塞至补充）。"""
+        while True:
+            with self._lock:
+                now = time.time()
+                self._tokens = min(
+                    self.capacity,
+                    self._tokens + (now - self._last) * self.rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # 计算还需等待的秒数，缩小锁内休眠窗口
+                wait = (1.0 - self._tokens) / self.rate
+            time.sleep(min(wait, 0.2))
+
 
 def _call_sdk_retry(fn, *args, retries: int = 3, **kwargs):
     """调用 SDK 方法，对网络异常与限流/繁忙码做带退避重试。
@@ -64,6 +104,9 @@ def _call_sdk_retry(fn, *args, retries: int = 3, **kwargs):
     last_exc = None
     for attempt in range(retries):
         try:
+            # 主动限流: 每次请求前从全局令牌桶取一个令牌（未启用时无操作）
+            if _GLOBAL_RATE_LIMITER is not None:
+                _GLOBAL_RATE_LIMITER.acquire()
             result = fn(*args, **kwargs)
         except httpx.HTTPError as e:
             last_exc = e
@@ -160,6 +203,24 @@ class OKXClient:
         # 每轮扫描每币种请求会触发限流，缓存 10 分钟。
         self._lsr_cache: Dict[str, Tuple[float, float]] = {}
         self._lsr_cache_ttl = 600.0  # 10 分钟
+
+        # 全局 API 限流令牌桶 (2026-08-14 顶级交易所实践)：主动控制 QPS，
+        # 避免触发 OKX 429 降权。模块级单例，dry_run 模拟盘不启用（其下单/持仓
+        # 端点走本地假数据，仅剩低频行情调用，已被 coin_tracker 批间隔节流）。
+        global _GLOBAL_RATE_LIMITER
+        _rl_cfg = (cfg.get("rate_limit") or {}) if isinstance(cfg.get("rate_limit"), dict) else {}
+        if (not self.dry_run) and _rl_cfg.get("enabled", True):
+            try:
+                _qps = float(_rl_cfg.get("max_qps", 10) or 10)
+                _burst = float(_rl_cfg.get("burst_capacity", 20) or 20)
+                _GLOBAL_RATE_LIMITER = _TokenBucket(_qps, _burst)
+                logger.info(
+                    f"[RateLimit] 全局令牌桶已启用: {_qps:.1f} QPS, "
+                    f"突发容量 {_burst:.0f}")
+            except (TypeError, ValueError):
+                _GLOBAL_RATE_LIMITER = None
+        else:
+            _GLOBAL_RATE_LIMITER = None
 
     # ------------------------------------------------------------------
     # 内部辅助方法
@@ -317,6 +378,51 @@ class OKXClient:
         except Exception as e:
             logger.error(f"get_order_book exception: {e}")
             return None
+
+    def get_order_book_depth_usd(
+        self,
+        inst_id: str,
+        levels: int = 10,
+        ct_val: float = 0.01,
+    ) -> Optional[dict]:
+        """计算前 N 档订单簿的 USDT 名义深度 (2026-08-14 流动性检查)。
+
+        顶级交易所/做市商开仓前必看订单簿深度：名义仓位相对前 N 档深度
+        过大时，平仓市价兜底会吃掉多档、滑点远超成本模型估算。本方法把
+        前 levels 档的 bids/asks 各累加成 USDT 名义深度，供流动性门槛使用。
+
+        OKX orderbook 每档结构: [px, sz, liquidatedOrders, numOrders]，
+        sz 是合约张数，USDT 深度 = Σ px × sz × ctVal。
+
+        Args:
+            inst_id: 合约 ID
+            levels: 档位数
+            ct_val: 合约面值 (USDT)
+
+        Returns:
+            {"bids_usd": float, "asks_usd": float} 或 None (查询失败)
+        """
+        book = self.get_order_book(inst_id, sz=levels)
+        if not book:
+            return None
+
+        def _sum_usd(entries):
+            total = 0.0
+            for row in (entries or []):
+                try:
+                    px = float(row[0])
+                    sz = float(row[1])
+                    if px > 0 and sz > 0:
+                        total += px * sz * ct_val
+                except (ValueError, IndexError, TypeError):
+                    continue
+            return total
+
+        bids_usd = _sum_usd(book.get("bids"))
+        asks_usd = _sum_usd(book.get("asks"))
+        if bids_usd <= 0 and asks_usd <= 0:
+            return None
+        return {"bids_usd": bids_usd, "asks_usd": asks_usd}
 
     def get_open_interest(self, inst_id: str) -> Optional[float]:
         """获取当前未平仓合约量 (OI)。"""
@@ -1594,8 +1700,11 @@ class OKXClient:
             if end:
                 kwargs["end"] = end
             if bill_type:
-                kwargs["billType"] = bill_type
-            result = self._account.get_bills(**kwargs)
+                # 修复 2026-08-14: SDK v0.4.3 账单参数名为 `type`（非 billType），
+                # 方法名为 `get_account_bills`（非 get_bills）。旧调用会 AttributeError
+                # 被 except 吞掉返回 []，导致账单拉取永远为空。
+                kwargs["type"] = bill_type
+            result = self._account.get_account_bills(**kwargs)
             if result.get("code") == "0":
                 return result.get("data", [])
             logger.error(f"get_bills failed: {result.get('msg')}")
@@ -1628,8 +1737,9 @@ class OKXClient:
             if end:
                 kwargs["end"] = end
             if bill_type:
-                kwargs["billType"] = bill_type
-            result = self._account.get_bills_archive(**kwargs)
+                # 修复 2026-08-14: SDK v0.4.3 参数名为 `type`（非 billType）。
+                kwargs["type"] = bill_type
+            result = self._account.get_account_bills_archive(**kwargs)
             if result.get("code") == "0":
                 return result.get("data", [])
             logger.error(f"get_bills_archive failed: {result.get('msg')}")
