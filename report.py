@@ -164,7 +164,7 @@ def generate_html_report(
 </head>
 <body>
 <div class="container">
-<h1>OKX FVG 交易 Agent — {session_label} 研究报告</h1>
+<h1>FVG KILLER — {session_label} 研究报告</h1>
 <p style="color:#8b949e;">生成时间: {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间) | 追踪币种: {total} | 有信号: {with_signals} | 有分析: {with_analysis}</p>
 
 <div class="summary">
@@ -287,7 +287,7 @@ def generate_html_report(
 
     html += f"""
 <div class="footer">
-  <p>OKX FVG Trading Agent v3.2 | 报告自动生成于 {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</p>
+  <p>FVG KILLER（公允价值缺口杀手）v3.3 | 报告自动生成于 {now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)</p>
   <p>本报告仅供参考，不构成投资建议。加密货币交易风险极高，请谨慎决策。</p>
 </div>
 </div>

@@ -1,5 +1,5 @@
 {
-  "_comment": "OKX FVG Trading Agent v3.2 — 复制为 config.json 并填入你的 API 密钥",
+  "_comment": "FVG KILLER（公允价值缺口杀手）v3.3 — 复制为 config.json 并填入你的 API 密钥",
   "okx": {
     "api_key": "YOUR_API_KEY",
     "api_secret": "YOUR_API_SECRET",

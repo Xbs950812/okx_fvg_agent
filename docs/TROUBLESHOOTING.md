@@ -1,4 +1,4 @@
-# 故障排除 — OKX FVG Agent v3.3
+# 故障排除 — FVG KILLER（公允价值缺口杀手）v3.3
 
 > 配套文档：[使用方法](USAGE.md) · [更新手册](UPDATE_MANUAL.md)
 

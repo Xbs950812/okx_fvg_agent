@@ -1,4 +1,4 @@
-# OKX FVG 交易 Agent v3.3
+# FVG KILLER（公允价值缺口杀手）v3.3
 
 基于 Fair Value Gap (FVG) 的 OKX 永续合约自动交易机器人，融合 GitHub Top 3 开源项目精华。
 

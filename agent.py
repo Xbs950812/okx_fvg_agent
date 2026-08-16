@@ -1,5 +1,5 @@
 """
-OKX FVG 交易 Agent — 主循环。
+FVG KILLER（公允价值缺口杀手）— OKX 永续合约 FVG 交易主循环。
 
 融合 GitHub Top 3 开源项目精华：
   - freqtrade (52k ⭐): Hyperopt 参数优化 + Edge 分析 + Trailing Stop + FreqAI + Kelly
@@ -122,7 +122,8 @@ try:
 except ImportError:
     _BACKTEST_AVAILABLE = False
 
-AGENT_VERSION = "v3.2"
+AGENT_VERSION = "v3.3"
+AGENT_NAME = "FVG KILLER"              # 公允价值缺口杀手
 
 # 修复 M-2: 模块级清理注册表，替代 main_loop 函数对象上的动态属性挂载
 # _ws_cache / _tracker 等资源不应挂在函数对象上，造成序列化和 GC 风险
@@ -2915,7 +2916,7 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
     # ---- 启动日志 ----
     demo_mode = config["okx"].get("demo", False)
     logger.info("=" * 60)
-    logger.info(f"  OKX FVG Trading Agent {AGENT_VERSION} — 全模块融合版")
+    logger.info(f"  {AGENT_NAME}（公允价值缺口杀手）{AGENT_VERSION} — OKX 全模块融合版")
     logger.info(f"  融合: freqtrade(52k⭐) + TradingAgents(86k⭐) + Vibe-Trading(23.6k⭐)")
     logger.info(f"  Mode: {'🟡 DEMO 模拟交易' if demo_mode else '🔴 LIVE 实盘交易'}")
     logger.info(f"  Dry Run: {config['agent'].get('dry_run', False)}")
@@ -5733,7 +5734,7 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OKX FVG 交易机器人 — 基于 Fair Value Gap 的合约交易 Agent"
+        description="FVG KILLER（公允价值缺口杀手）— 基于 Fair Value Gap 的 OKX 合约交易 Agent"
     )
     parser.add_argument(
         "-c", "--config", "--配置文件",

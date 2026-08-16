@@ -1557,7 +1557,7 @@ def generate_html_report(
 
     html += f"""
 <div class="footer">
-  <p>OKX FVG Trading Agent — 历史交易超详细分析报告</p>
+  <p>FVG KILLER（公允价值缺口杀手）— 历史交易超详细分析报告</p>
   <p>生成时间: {now} (北京时间) | 本报告仅供参考，不构成投资建议</p>
 </div>
 </div>

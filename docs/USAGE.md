@@ -1,4 +1,4 @@
-# 使用方法 — OKX FVG Agent v3.3
+# 使用方法 — FVG KILLER（公允价值缺口杀手）v3.3
 
 > 配套文档：[README.md](../README.md)（项目概览） · [故障排除](TROUBLESHOOTING.md) · [更新手册](UPDATE_MANUAL.md)
 
