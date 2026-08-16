@@ -19,6 +19,7 @@
 
 | 文档 | 内容 |
 |------|------|
+| [LICENSE](LICENSE) | 开源协议 — PolyForm Shield 1.0.0 + 作者附加条款（Royalty 盈利分成） |
 | [docs/USAGE.md](docs/USAGE.md) | 使用方法 — 安装/配置/运行模式/日志监控/测试 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 故障排除 — 网络/限流/挂单/状态文件/常见报错 |
 | [docs/UPDATE_MANUAL.md](docs/UPDATE_MANUAL.md) | 更新手册 — v3.3 变更清单/配置迁移/行为变化/回滚 |
@@ -62,7 +63,7 @@
 你的亏损            → 不收取任何分成
 ```
 
-**协议条款**：免费使用、修改、分发本项目的条件是保留本分成功能与默认收款地址。移除/关闭分成或修改收款地址需获得作者商业授权。
+**协议条款**：本软件采用 **PolyForm Shield 1.0.0 + 作者附加条款（Royalty Provision）** 授权，详见根目录 [LICENSE](LICENSE)。要点：任何用途（含实盘盈利）均可免费使用，唯一条件是**保留盈利分成功能与默认收款地址**；禁止将本软件改造成与作者竞争的产品；移除/关闭分成需商业授权。
 
 **关键行为**：
 - 只对盈利收取，亏损/保本不计入
@@ -102,6 +103,7 @@ okx_fvg_agent/
 ├── config.example.json # 配置模板 (复制为 config.json 并填入密钥)
 ├── start_agent.bat     # Windows 一键启动
 ├── requirements.txt    # Python 依赖
+├── LICENSE             # PolyForm Shield 1.0.0 + Royalty 附加条款
 ├── docs/               # 使用方法 / 故障排除 / 更新手册
 ├── test_*.py           # 单元测试 (197 项)
 ├── verify_*.py         # 蒙特卡洛/档位切换验证脚本

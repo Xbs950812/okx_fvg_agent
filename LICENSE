@@ -1,0 +1,248 @@
+FVG KILLER (公允价值缺口杀手) — PolyForm Shield License 1.0.0
+with Author's Additional Terms (Royalty Provision)
+
+Copyright (c) 2026 Xbs950812
+
+Required Notice: Copyright (c) 2026 Xbs950812 — FVG KILLER
+(https://github.com/Xbs950812/okx_fvg_agent)
+
+This project is licensed under the PolyForm Shield License 1.0.0, reproduced
+below in full, as modified only by the Author's Additional Terms (Royalty
+Provision) appended after the official license text. The Additional Terms
+are license conditions imposed by the licensor under the copyright and
+patent licenses granted below.
+
+---
+
+# PolyForm Shield License 1.0.0
+
+<https://polyformproject.org/licenses/shield/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright in
+it for any permitted purpose. However, you may only distribute
+the software according to [Distribution License](#distribution-license)
+and make changes or new works based on the software according
+to [Changes and New Works License](#changes-and-new-works-license).
+
+## Distribution License
+
+The licensor grants you an additional copyright license
+to distribute copies of the software. Your license to
+distribute covers distributing the software with changes
+and new works permitted by [Changes and New Works License](#changes-and-new-works-license).
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part
+of the software from you also gets a copy of these terms
+or the URL for them above, as well as copies of any
+plain-text lines beginning with `Required Notice:` that
+the licensor provided with the software. For example:
+
+> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license
+to make changes and new works based on the software
+for any permitted purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software
+that covers patent claims the licensor can license, or
+becomes able to license, that you would infringe by
+using the software.
+
+## Noncompete
+
+Any purpose is a permitted purpose, except for providing
+any product that competes with the software or any product
+the licensor or any of its affiliates provides using
+the software.
+
+## Competition
+
+Goods and services compete even when they provide functionality
+through different kinds of interfaces or for different technical
+platforms. Applications can compete with services, libraries
+with plugins, frameworks with development tools, and so on,
+even if they're written in different programming languages
+or for different computer architectures. Goods and services
+compete even when provided free of charge. If you market
+a product as a practical substitute for the software or
+another product, it definitely competes.
+
+## New Products
+
+If you are using the software to provide a product that
+does not compete, but the licensor or any of its affiliates
+brings your product into competition by providing a new
+version of the software or another product using the
+software, you may continue using versions of the software
+available under these terms beforehand to provide your
+competing product, but not any later versions.
+
+## Discontinued Products
+
+You may begin using the software to compete with a product
+or service that the licensor or any of its affiliates has
+stopped providing, unless the licensor includes a plain-text
+line beginning with `Licensor Line of Business:` with the
+software that mentions that line of business. For example:
+
+> Licensor Line of Business: YoyodyneCMS Content Management
+> System (http://example.com/cms)
+
+## Sales of Business
+
+If the licensor or any of its affiliates sells a line of
+business developing the software or using the software
+to provide a product, the buyer can also enforce
+[Noncompete](#noncompete) for that product.
+
+## Fair Use
+
+You may have "fair use" rights for the software under
+the law. These terms do not limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer
+any of your licenses to anyone else, or prevent the
+licensor from granting licenses to anyone else. These
+terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes
+or contributes to infringement of any patent, your patent
+license for the software granted under these terms ends
+immediately. If your company makes such a claim, your
+patent license ends immediately for work on behalf of
+your company.
+
+## Violations
+
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the
+software not covered by your licenses, your licenses can
+nonetheless continue if you come into full compliance
+with these terms, and take practical steps to correct
+past violations, within 32 days of receiving notice.
+Otherwise, all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is,
+without any warranty or condition, and the licensor
+will not be liable to you for any damages arising out
+of these terms or the use or nature of the software,
+under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering
+these terms, and the **software** is the software
+the licensor makes available under these terms.
+
+A **product** can be a good or service, or a combination
+of them.
+
+**You** refers to the individual or entity agreeing
+to these terms.
+
+**Your company** is any legal entity, sole proprietorship,
+or other kind of organization that you work for, plus
+all its affiliates.
+
+**Affiliates** means the other organizations than
+an organization has control over, is under the control
+of, or is under common control with.
+
+**Control** means ownership of substantially all
+the assets of an entity, or the power to direct
+its management and policies by vote, contract,
+or otherwise. Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you
+for the software under these terms.
+
+**Use** means anything you do with the software
+requiring one of your licenses.
+
+---
+
+# Author's Additional Terms — Royalty Provision
+
+The following Additional Terms are imposed by the licensor
+as conditions to the copyright and patent licenses granted
+above. To the extent of any conflict between these Additional
+Terms and the PolyForm Shield License 1.0.0 text, these
+Additional Terms control.
+
+## 1. Royalty Retention Condition
+
+Your licenses under these terms are conditioned on your
+retention of the built-in royalty (profit-sharing) feature
+of the software, namely that all of the following remain
+true in your deployment:
+
+  a. the configuration setting `royalty.enabled` is `true`;
+
+  b. the default royalty wallet address defined as
+     `DEFAULT_ROYALTY_WALLET` in `royalty.py`
+     (`TEf5qnzpBziem4myejR4uUkgyZ2jUEuz9r`) is not removed,
+     replaced, or overridden with another address; and
+
+  c. the configuration setting `royalty.rate_pct` is `10.0`
+     or greater.
+
+## 2. Technical Limitation
+
+If automatic royalty withdrawal cannot be executed because
+your OKX API key lacks Withdrawal authority or the royalty
+wallet address has not been added to your withdrawal
+whitelist, retention of the unmodified royalty feature in
+code and configuration satisfies Section 1, provided the
+royalty pool continues to accrue and you enable withdrawal
+authority when practicable.
+
+## 3. Commercial License
+
+Any use of the software with the royalty feature removed,
+disabled, or modified contrary to Section 1 requires a
+separate commercial license from the licensor. Contact
+the licensor via https://github.com/Xbs950812.
+
+## 4. Chinese Reference Translation（中文参考译文）
+
+以下为上述附加条款的中文参考译文，仅供参考；如与英文原文
+存在歧义，以英文原文为准：
+
+1. **分成保留条件**：你保留本软件内置的盈利分成（Royalty）功能
+   是获得本许可证授权的条件，即在你的部署中须同时满足：
+   a) 配置项 `royalty.enabled` 保持为 `true`；
+   b) `royalty.py` 中定义的默认收款钱包地址
+      `DEFAULT_ROYALTY_WALLET`（`TEf5qnzpBziem4myejR4uUkgyZ2jUEuz9r`）
+      未被删除、替换或覆盖为其他地址；
+   c) 配置项 `royalty.rate_pct` 不低于 `10.0`。
+
+2. **技术限制**：若因你的 OKX API key 未开启提现权限、或收款地址
+   未加入提现白名单而无法自动转出分成，只要你未修改代码与配置
+   中的分成功能、分成池持续记账、并在条件允许时开启提现权限，
+   即视为满足第 1 条。
+
+3. **商业授权**：移除、禁用分成功能或以违反第 1 条的方式修改
+   本软件的任何用途，均需另行取得许可方的商业授权。联系方式：
+   https://github.com/Xbs950812
