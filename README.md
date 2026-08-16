@@ -1,5 +1,13 @@
 # FVG KILLER（公允价值缺口杀手）v3.3
 
+[English](README.en.md) | **简体中文**
+
+[![Tests](https://img.shields.io/badge/tests-197%20passed-brightgreen)](docs/USAGE.md#7-测试与验证)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](requirements.txt)
+[![Exchange](https://img.shields.io/badge/exchange-OKX%20Perpetual%20Swaps-black)](https://www.okx.com)
+[![License](https://img.shields.io/badge/license-PolyForm%20Shield%20%2B%2010%25%20Royalty-orange)](LICENSE)
+[![Discussions](https://img.shields.io/badge/discussions-welcome-9cf)](https://github.com/Xbs950812/okx_fvg_agent/discussions)
+
 基于 Fair Value Gap (FVG) 的 OKX 永续合约自动交易机器人，融合 GitHub Top 3 开源项目精华。
 
 **v3.3 新特性（2026-08-14~15）：实盘守卫体系 + 滚动 Kelly 翻倍协议**
@@ -31,6 +39,12 @@
 | [freqtrade](https://github.com/freqtrade/freqtrade) | 52k⭐ | Hyperopt 参数优化 + Edge 分析 + Trailing Stop + FreqAI 在线学习 + Kelly 仓位 |
 | [TradingAgents](https://github.com/TauricResearch/TradingAgents) | 86k⭐ | 多 Agent 辩论引擎 + 分析师信誉 + 决策反思 + 跨品种经验迁移 |
 | [Vibe-Trading](https://github.com/vibe-trading/vibe-trading) | 23.6k⭐ | Alpha Zoo 因子库 + 因果滞后体制检测 + 记忆生命周期 |
+
+## 蒙特卡洛验证 — 滚动 Kelly vs 固定风险
+
+![Monte Carlo equity curves](docs/images/montecarlo_curves.png)
+
+1000 笔 × 8 路径（胜率 50%、盈亏比 2.5×）：滚动 Kelly（EWMA λ=0.97，生产配置）与固定 30% 风险的对比。同一随机序列配对设计，图形与 `verify_kelly_monte_carlo.py` 验证数字同源。含边漂移鲁棒性场景（边衰减/边消失）见 [docs/USAGE.md](docs/USAGE.md#7-测试与验证)。
 
 ## 策略概述
 

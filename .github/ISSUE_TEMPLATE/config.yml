@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 提问与讨论 / Q&A and discussions
+    url: https://github.com/Xbs950812/okx_fvg_agent/discussions
+    about: 使用问题、策略讨论、经验分享请到 Discussions / Usage questions and strategy chat go to Discussions
+  - name: 📖 使用方法 / Usage guide
+    url: https://github.com/Xbs950812/okx_fvg_agent/blob/master/docs/USAGE.md
+    about: 安装/配置/运行模式/日志关键字 / Install, config, run modes, log keywords
+  - name: 🔧 故障排除 / Troubleshooting
+    url: https://github.com/Xbs950812/okx_fvg_agent/blob/master/docs/TROUBLESHOOTING.md
+    about: 网络/限流/挂单/状态文件问题排查 / Network, rate limits, order and state issues
