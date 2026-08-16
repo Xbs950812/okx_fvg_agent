@@ -1,11 +1,27 @@
-# OKX FVG 交易 Agent v3.2
+# OKX FVG 交易 Agent v3.3
 
 基于 Fair Value Gap (FVG) 的 OKX 永续合约自动交易机器人，融合 GitHub Top 3 开源项目精华。
+
+**v3.3 新特性（2026-08-14~15）：实盘守卫体系 + 滚动 Kelly 翻倍协议**
+- 全局 API 限流令牌桶（主动 QPS 控制，防 429 降权）
+- 开仓前订单簿流动性检查（名义仓 / 对侧前 10 档深度 > 5% 拒单，防崩盘薄书滑点）
+- 波动率目标仓位（ATR% 缩放保证金，高波动币自动降仓）
+- 滚动分数 Kelly 风险上限（<50 笔 1/4 Kelly 探索档 → ≥50 笔 1/2 Kelly 利用档，EWMA 平滑）
+- 每日最大交易次数 / 实际滑点回填闭环 / 启动三方对账 / 资金费率实际对账
+- 验证资产：169 项单元测试 + 300 路径×1000 笔蒙特卡洛（含边漂移鲁棒性）
 
 **v3.2 新特性：**
 - 三挡研判系统（激进/均衡/保守），一键切换交易频率
 - 前 100 名合约全天候追踪研究
 - 亚洲/欧洲/美国三时段自动生成 HTML 研究报告，支持邮件推送
+
+## 文档索引
+
+| 文档 | 内容 |
+|------|------|
+| [docs/USAGE.md](docs/USAGE.md) | 使用方法 — 安装/配置/运行模式/日志监控/测试 |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 故障排除 — 网络/限流/挂单/状态文件/常见报错 |
+| [docs/UPDATE_MANUAL.md](docs/UPDATE_MANUAL.md) | 更新手册 — v3.3 变更清单/配置迁移/行为变化/回滚 |
 
 ## 融合来源
 
@@ -40,20 +56,25 @@
 
 ```
 okx_fvg_agent/
-├── agent.py            # 主循环入口 (v3.2)
+├── agent.py            # 主循环入口 (v3.3)
 ├── strategy.py         # FVG 检测 + 异常波动 + 信号生成
-├── executor.py         # 仓位计算 + 下单 + 持仓监控 + 提现
-├── okx_client.py       # OKX API v5 客户端 (支持代理/模拟盘)
+├── executor.py         # 仓位计算 + 下单 + 订单簿流动性检查 + 持仓监控
+├── okx_client.py       # OKX API v5 客户端 (代理/模拟盘/限流令牌桶)
+├── paper_trading.py    # 纸面交易引擎 (限价回补成交/爆仓封顶/滑点语义)
 ├── multi_channel.py    # 五通道信息分析 + 超级交易专家引擎
 ├── optimization.py     # Edge 分析 + 自适应调参 + Trailing Stop
 ├── memory.py           # 决策日志 + 反思引擎 + 体制记忆
 ├── debate_engine.py    # TradingAgents 多 Agent 辩论引擎
-├── hyperopt.py         # freqtrade 参数优化 + Kelly + FreqAI
+├── hyperopt.py         # freqtrade 参数优化 + Kelly + 滚动Kelly(EWMA) + FreqAI
 ├── alpha_zoo.py        # Vibe-Trading Alpha 因子库 + 体制检测 + 记忆生命周期
 ├── coin_tracker.py     # 后台币种追踪研究（前 100 名合约）
 ├── report.py           # 定时 HTML 研究报告生成 + SMTP 邮件发送
-├── config.json         # 配置文件 (v3.2)
+├── config.example.json # 配置模板 (复制为 config.json 并填入密钥)
+├── start_agent.bat     # Windows 一键启动
 ├── requirements.txt    # Python 依赖
+├── docs/               # 使用方法 / 故障排除 / 更新手册
+├── test_*.py           # 单元测试 (169 项)
+├── verify_*.py         # 蒙特卡洛/档位切换验证脚本
 ├── reports/            # 研究报告输出目录
 └── README.md           # 本文件
 ```
@@ -100,19 +121,30 @@ pip install -r requirements.txt
 }
 ```
 
-### 4. 模拟运行（推荐先测试）
+### 4. 纸面模式（推荐先测试）
 
-```bash
-python agent.py --演练 --单轮
+`config.json` 中同时打开 `agent.dry_run=true` 和 `paper.enabled=true`，虚拟余额 + 实时行情模拟完整交易生命周期（限价回补成交/止盈止损/爆仓封顶），绝不下真实单：
+
+```json
+{
+  "agent": { "dry_run": true },
+  "paper": { "enabled": true, "balance": 30.0 }
+}
 ```
 
-模拟模式不会实际下单，只输出信号日志。
+```bash
+python agent.py
+```
+
+纯演练模式（只输出信号日志、不模拟持仓）：`python agent.py --演练 --单轮`
 
 ### 5. 实盘运行
 
 ```bash
 python agent.py
 ```
+
+> 切实盘前必读 [docs/UPDATE_MANUAL.md](docs/UPDATE_MANUAL.md) — 实盘模式下限流令牌桶、订单簿流动性检查、启动三方对账会自动生效。
 
 ### 6. 切换挡位
 
@@ -222,13 +254,27 @@ python agent.py --配置文件 my_config.json
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `risk_per_trade_pct` | `1.0` | 单笔风险比例（1%） |
+| `risk_per_trade_pct` | `30.0` | 单笔风险上限（以损定量上限，满倍率模式下与保证金比例对齐） |
 | `max_leverage` | `10` | 最大杠杆倍数 |
+| `max_position_leverage` | `0` | 单笔杠杆封顶（0=不封顶，执行杠杆=币种最大杠杆） |
 | `margin_mode` | `isolated` | 逐仓模式 |
 | `margin_pct` | `30` | 最大保证金比例（30%） |
 | `profit_withdrawal_pct` | `25` | 翻倍后提现比例（25%） |
 | `max_positions` | `1` | 最大同时持仓数 |
 | `max_daily_loss_pct` | `10` | 每日最大亏损比例 |
+| `max_daily_trades` | `0` | 每日最大平仓笔数（0=不限制，实盘建议 6~10） |
+| `rolling_kelly` | 见模板 | 滚动分数 Kelly 风险上限（探索→利用，EWMA 平滑） |
+| `order_book_depth` | 见模板 | 订单簿流动性检查（5% 阈值，仅实盘路径） |
+| `vol_targeting` | 见模板 | 波动率目标仓位（ATR% 缩放保证金） |
+
+### 限流与对账 (`okx.rate_limit` / `agent.reconciliation`)
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `okx.rate_limit.max_qps` | `10` | 全局令牌桶 QPS（实盘生效，纸面自动关闭） |
+| `okx.rate_limit.burst_capacity` | `20` | 突发容量 |
+| `agent.reconciliation.startup_enabled` | `true` | 启动三方对账（持仓↔本地状态↔保护单） |
+| `agent.reconciliation.funding_fee_interval_rounds` | `6` | 资金费率实际对账间隔（轮） |
 
 ### 自适应调参 (`optimization`)
 
