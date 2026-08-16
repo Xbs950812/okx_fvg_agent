@@ -30,11 +30,12 @@ except ImportError:  # 理论不可达(SDK 强依赖 httpx)，防御
     httpx = None
 
 from okx.Account import AccountAPI
+from okx.Funding import FundingAPI
 from okx.MarketData import MarketAPI
 from okx.PublicData import PublicAPI
 from okx.Trade import TradeAPI
 from okx.TradingData import TradingDataAPI
-from okx.consts import POST, PLACE_ALGO_ORDER
+from okx.consts import POST, PLACE_ALGO_ORDER, WITHDRAWAL_COIN
 
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,11 @@ class OKXClient:
             **auth_kwargs,
         )
         self._trade = TradeAPI(
+            self.api_key, self.api_secret, self.passphrase, False,
+            **auth_kwargs,
+        )
+        # 资金账户模块 (Royalty 分成提现/资金划转用)
+        self._funding = FundingAPI(
             self.api_key, self.api_secret, self.passphrase, False,
             **auth_kwargs,
         )
@@ -1962,3 +1968,122 @@ class OKXClient:
             f"发现 {len(result)} 个共识币种 (≥{min_traders_holding}人持有)"
         )
         return result
+
+    # ------------------------------------------------------------------
+    # 资金账户 / 链上提现 (Royalty 盈利分成用)
+    # ------------------------------------------------------------------
+
+    def get_withdrawal_fee_info(self, chain: str = "USDT-TRC20"
+                                ) -> Optional[Tuple[float, float]]:
+        """查询链上提现手续费与最小提现额。
+
+        经 GET /api/v5/asset/currencies 获取指定链的 minFee / minWd。
+
+        Returns:
+            (fee, min_wd) 元组；查询失败或未找到链信息返回 None (fail-closed)
+        """
+        try:
+            result = _call_sdk_retry(self._funding.get_currencies, ccy="USDT")
+            for d in (result or {}).get("data", []) or []:
+                if d.get("chain") == chain:
+                    fee = self._safe_float(d.get("minFee"), 0.0)
+                    min_wd = self._safe_float(d.get("minWd"), 0.0)
+                    if fee > 0:
+                        return (fee, min_wd)
+            logger.error(f"get_withdrawal_fee_info: 未找到链 {chain} 的费率信息")
+            return None
+        except Exception as e:
+            logger.error(f"get_withdrawal_fee_info exception: {e}")
+            return None
+
+    def get_funding_balance(self, ccy: str = "USDT") -> Optional[float]:
+        """获取资金账户 (funding) 某币种可用余额。
+
+        Returns:
+            可用余额 (无该币种持仓时为 0.0)；查询失败返回 None (fail-closed,
+            调用方必须区分"余额为 0"与"查询失败")
+        """
+        try:
+            result = _call_sdk_retry(self._funding.get_balances, ccy=ccy)
+            data = (result or {}).get("data", []) or []
+            if not data:
+                return 0.0
+            d = data[0]
+            return self._safe_float(d.get("availBal") or d.get("bal"), 0.0)
+        except Exception as e:
+            logger.error(f"get_funding_balance exception: {e}")
+            return None
+
+    def transfer_trading_to_funding(self, ccy: str, amt: float) -> bool:
+        """交易账户 → 资金账户划转 (链上提现的前置步骤, 提现只能从资金账户发起)。
+
+        Args:
+            ccy: 币种, 如 USDT
+            amt: 划转金额 (USDT)
+
+        Returns:
+            划转是否成功
+        """
+        if amt <= 0:
+            return True
+        try:
+            # OKX 账户代码: 18=Trading account, 6=Funding account
+            result = _call_sdk_retry(
+                self._funding.funds_transfer, ccy, f"{amt:.2f}", "18", "6")
+            ok = bool(result) and result.get("code") == "0"
+            if not ok:
+                logger.error(
+                    f"transfer_trading_to_funding failed: "
+                    f"{(result or {}).get('msg')}")
+            return ok
+        except Exception as e:
+            logger.error(f"transfer_trading_to_funding exception: {e}")
+            return False
+
+    def submit_withdrawal(self, ccy: str, amt: float, fee: float,
+                          dest: str, to_addr: str, chain: str) -> Optional[dict]:
+        """发起链上提现 (Royalty 分成专用)。
+
+        注: SDK v0.4.3 的 FundingAPI.withdrawal() 未暴露必填的 fee 参数,
+        故复用 SDK 底层 _request_with_params (自动签名) 发送完整请求体。
+
+        Args:
+            ccy: 币种 (USDT)
+            amt: 提现数量 (保守口径: 到账额, 总扣款 = amt + fee)
+            fee: 链上手续费 (从 get_withdrawal_fee_info 实时获取)
+            dest: "3"=链上提现
+            to_addr: 收款地址 (TRC20)
+            chain: 链名 (USDT-TRC20)
+
+        Returns:
+            OKX 响应 dict (含 code/msg/data[wdId]); 网络异常返回 None
+        """
+        params = {
+            "ccy": ccy,
+            "amt": f"{amt:.2f}",
+            "fee": f"{fee:.2f}",
+            "dest": dest,
+            "toAddr": to_addr,
+            "chain": chain,
+        }
+        try:
+            return self._funding._request_with_params(POST, WITHDRAWAL_COIN, params)
+        except Exception as e:
+            logger.error(f"submit_withdrawal exception: {e}")
+            return None
+
+    def get_withdrawal_info(self, wd_id: str) -> Optional[dict]:
+        """按 wdId 查询单笔提现状态 (核验 pending 提现到账)。
+
+        Returns:
+            OKX 响应 dict, data[0].state ∈ Pending/Review/Success/Failure...
+        """
+        if not wd_id:
+            return None
+        try:
+            return _call_sdk_retry(
+                self._funding.get_withdrawal_history,
+                ccy="USDT", wdId=wd_id)
+        except Exception as e:
+            logger.error(f"get_withdrawal_info exception: {e}")
+            return None

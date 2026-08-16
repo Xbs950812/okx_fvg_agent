@@ -1,6 +1,7 @@
 # 更新手册 — FVG KILLER v3.2 → v3.3
 
 > 2026-08-14~15 增强：**实盘守卫体系 + 滚动 Kelly 翻倍协议**
+> 2026-08-16 追加：**盈利分成模块（Royalty）— 开源分成协议**
 > 配套文档：[使用方法](USAGE.md) · [故障排除](TROUBLESHOOTING.md)
 
 ## 1. 变更总览
@@ -15,8 +16,27 @@
 | 守卫 | 启动三方对账 + 资金费率 bills 对账 | **仅实盘** |
 | 协议 | 滚动分数 Kelly 风险上限（探索→利用） | 全模式（样本 ≥10 笔起） |
 | 协议 | EWMA 输入端平滑（λ=0.97，防窗口边界跳变） | 全模式 |
+| 分成 | 盈利分成 Royalty（盈利 10% 计池 → 20 USDT 自动 TRC20 提现） | **仅实盘**（paper/dry_run 只记日志） |
 | 修复 | okx_client.get_bills 调用不存在的 SDK 方法（账单恒空） | 影响 trade_analyzer |
-| 测试 | 169 项单测 + 蒙特卡洛验证资产 | — |
+| 测试 | 197 项单测（含 test_royalty.py 28 项）+ 蒙特卡洛验证资产 | — |
+
+## 1a. 盈利分成模块（2026-08-16 追加）
+
+**新文件**：`royalty.py`（开源核心组件）+ `royalty_state.json`（运行时状态，已入 .gitignore）
+
+**行为**：
+- 平仓确认点（`[Close]` 日志处）对**已实现盈利**（pnl>0）计 `rate_pct`（默认 10%）入池
+- 池 ≥ `min_withdraw_usdt`（默认 20）且池-手续费 ≥ 交易所最小提现额时自动提现：
+  查费率（`/asset/currencies`）→ trading→funding 划转补缺口 → 链上提现
+  （`/asset/withdrawal`，含 SDK 未暴露的 fee 参数，走底层请求）→ 记 wdId 流水
+- **权限降级**：API key 无 Withdraw 权限（code 50101 等）→ 小时级冷却重试 + 日志提醒，交易不受任何影响
+- **模拟模式安全**：paper/dry_run 绝不真实转账、不写池状态（防虚拟盈利污染实盘分成池）
+
+**配置迁移**：`config.json` 无 `royalty` 段时代码用硬编码默认值（enabled=true、
+内置作者钱包、10%、20 USDT、300s 重试）。`config.example.json` 已含完整段。
+
+**用户须知**：自动提现需在 OKX 后台开启 API 的 Withdraw 权限并将收款地址加入
+提现白名单；不开启则仅记账累积。关闭分成或改地址需作者商业授权（见 README）。
 
 ## 2. 滚动 Kelly 翻倍协议（核心行为变化）
 

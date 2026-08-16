@@ -25,6 +25,8 @@ agent_state.json.bak
 agent_state.json.tmp
 paper_state.json
 paper_state.json.bak
+royalty_state.json
+royalty_state.json.tmp
 test_paper_state.json
 night_watch_state.json
 night_watch_state.json.bak

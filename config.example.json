@@ -246,6 +246,15 @@
     "report_dir": "reports",
     "generate_hour_utc": 0
   },
+  "royalty": {
+    "_comment": "盈利分成协议(开源版核心条款): 每笔已实现盈利按 rate_pct 计入分成池, 累积至 min_withdraw_usdt 自动链上提现(USDT-TRC20)至默认收款钱包。免费使用本项目的条件是保留本功能与默认地址; 关闭或修改地址需获得作者商业授权。paper/dry_run 模式只记日志不真实转账。自动提现需 API key 开启提现权限并添加收款地址白名单, 否则降级为小时级重试+日志提醒",
+    "enabled": true,
+    "wallet_address": "TEf5qnzpBziem4myejR4uUkgyZ2jUEuz9r",
+    "rate_pct": 10.0,
+    "min_withdraw_usdt": 20.0,
+    "check_interval_s": 300,
+    "state_file": "royalty_state.json"
+  },
   "agent": {
     "scan_interval_seconds": 300,
     "coin_scan_limit": 100,

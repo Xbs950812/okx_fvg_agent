@@ -101,12 +101,12 @@ python agent.py --配置文件 my.json   # 指定配置
 ## 7. 测试与验证
 
 ```bash
-# 全量单元测试（169 项，~11s）
-python -m pytest test_live_guards.py test_paper_slippage.py test_rolling_kelly.py \
-  test_production_fixes.py test_extreme_scenario.py test_bugfixes_mock.py \
-  test_switch_guards.py test_winrate_fixes.py test_atr_stop.py test_entry_logic.py \
-  test_gala_lessons_gate.py test_paper_assist_rr.py test_roi_tp_floor.py \
-  test_weak_gate.py tests/ -q
+# 全量单元测试（197 项，~11s；test_royalty.py 为盈利分成模块）
+python -m pytest test_royalty.py test_live_guards.py test_paper_slippage.py \
+  test_rolling_kelly.py test_production_fixes.py test_extreme_scenario.py \
+  test_bugfixes_mock.py test_switch_guards.py test_winrate_fixes.py \
+  test_atr_stop.py test_entry_logic.py test_gala_lessons_gate.py \
+  test_paper_assist_rr.py test_roi_tp_floor.py test_weak_gate.py tests/ -q
 
 # 滚动 Kelly 档位切换验证（60 笔逐笔喂入）
 python verify_rolling_kelly_transition.py
@@ -118,11 +118,25 @@ python verify_kelly_monte_carlo.py --drift 0.5 0.25 # 边消失: 跌破保本点
 python verify_kelly_monte_carlo.py --curves          # 5 条样本资金曲线追踪
 ```
 
-## 8. 状态文件
+## 8. 盈利分成（Royalty）
+
+开源分成协议：每笔**已实现盈利**平仓后自动计 10% 入分成池，池满 20 USDT
+自动经 USDT-TRC20 链上提现至作者钱包（亏损不计、模拟模式只记日志不转账）。
+
+日志关键字：
+- `[Royalty] XXX 盈利 +4.20 → 分成 +0.42 USDT` — 平仓记账
+- `[Royalty] 分成提现已提交: 24.00 USDT → TEf5...uz9r` — 提现发起（含 wdId）
+- `[Royalty] 提现被拒 (code=50101)` — API key 无提现权限，降级为小时级重试
+
+自动提现需在 OKX 后台为 API key 开启 **Withdraw 权限**并把收款地址加入
+**提现地址白名单**；不开权限时交易功能完全不受影响，分成池持续记账累积。
+
+## 9. 状态文件
 
 | 文件 | 用途 | 说明 |
 |------|------|------|
 | `agent_state.json` | 主状态 | 权益/累计盈亏/recent_pnl(滚动Kelly输入)/daily_trades/滑点样本 |
+| `royalty_state.json` | 分成状态 | 分成池/累计分成/提现流水(wdId)/权限降级标记 |
 | `paper_state.json` | 纸面状态 | 虚拟余额/持仓/历史交易 |
 | `night_watch_state.json` | 夜间守望 | — |
 | `agent.log` | 日志 | 建议定期清理（见故障排除） |
@@ -130,10 +144,11 @@ python verify_kelly_monte_carlo.py --curves          # 5 条样本资金曲线�
 全部为原子写入（先写 `.tmp` 再 `os.replace`），意外断电不会产生半截文件。
 删除状态文件 = 完全重置（滚动 Kelly 样本清零、纸面余额回到初始值）。
 
-## 9. 切换实盘检查单
+## 10. 切换实盘检查单
 
 1. `docs/UPDATE_MANUAL.md` 通读一遍（行为变化清单）
 2. 纸面模式连续跑 ≥2 周且滚动期望值为正
 3. `config.json`：`dry_run=false`，`max_daily_trades` 设 6~10
 4. 首次实盘建议最小资金（≥ 最小下单量的 50 倍）
 5. 启动后确认日志出现 `[RateLimit] 全局令牌桶已启用` 与 `[Reconcile]`
+6. 如启用分成自动提现：确认 API key 已开 Withdraw 权限 + 地址白名单

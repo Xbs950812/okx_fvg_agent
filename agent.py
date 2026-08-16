@@ -111,6 +111,7 @@ from walk_forward import WalkForwardAnalyzer
 from quant_report import QuantReportGenerator
 from risk_committee import RiskCommittee
 from cost_model import CostModel
+from royalty import RoyaltyManager
 
 # ---- Vibe-Trading 增强模块 (可选导入) ----
 try:
@@ -2751,6 +2752,17 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
             paper_engine = None
             logger.warning(f"  PaperTrading 初始化失败，禁用: {_pe}")
 
+    # ---- 盈利分成 (Royalty, 开源版核心组件) ----
+    # 每笔已实现盈利的 10% 计入分成池, 累积至阈值自动链上提现至作者钱包。
+    # paper/dry_run 模式只记日志不转账 (虚拟盈利不产生真实分成)。
+    royalty_mgr = RoyaltyManager(
+        config,
+        state_dir=os.path.dirname(__file__),
+        dry_run=config["agent"].get("dry_run", False),
+        paper=paper_engine is not None,
+    )
+    royalty_mgr.log_banner()
+
     # ---- 初始权益 ----
     # 修复: 启动时网络瞬时故障不应直接退出 — get_total_equity 单次调用超时
     # 即 return 会导致 7x24 无人值守中断（实测: OKX API 瞬时超时 agent 直接退出）。
@@ -2896,6 +2908,9 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
         round_start = time.time()
         logger.info(f"\n{'─'*50}\n  ROUND {round_count}  "
                     f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n{'─'*50}")
+
+        # ---- 盈利分成提现检查 (Royalty): 内部节流+阈值, 降级安全退出 ----
+        royalty_mgr.maybe_withdraw(client)
 
         # ---- 成单率漏斗 (2026-08-07): 累计 信号→挂单→成交 统计 ----
         if config.get("agent", {}).get("fill_funnel", {}).get("enabled", True):
@@ -3149,6 +3164,9 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                 else:
                     _realized_pnl = client.get_close_order_pnl(_pc_inst, _pc_ord)
                 state_manager.record_realized_pnl(_realized_pnl)
+                # 盈利分成记账 (Royalty): 盈利平仓后按 10% 计入分成池,
+                # 亏损/保本/纸面模式自动跳过 (内部全量守卫, 不影响主流程)
+                royalty_mgr.record_profit(_realized_pnl, _pc_inst)
                 logger.info(f"[Close] {_pc_inst} 平仓确认完成, "
                             f"交易所已实现盈亏={_realized_pnl:+.2f} USDT (等待 {_pc_age:.1f}s)")
 
