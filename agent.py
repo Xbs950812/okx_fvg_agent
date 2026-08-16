@@ -81,10 +81,15 @@ from debate_engine import (
 )
 from hyperopt import (
     compute_kelly,
-    rolling_kelly_risk_pct,
     FreqAIPipeline,
     run_full_optimization,
 )
+# PRO 模块（可选）: 滚动Kelly/波动率目标/对账/限流等 v3.3 增强功能。
+# 开源核心版无 fvg_killer_pro 时自动降级到 v3.2 行为（各调用点守卫）。
+try:
+    import fvg_killer_pro as _PRO
+except ImportError:
+    _PRO = None
 from alpha_zoo import (
     CausalHysteresisRegime,
 )
@@ -1388,164 +1393,6 @@ def _estimate_funding_cost(
     return funding_cost
 
 
-def _reconcile_funding_fees(
-    client: "OKXClient",
-    positions: Dict[str, dict],
-    config: dict,
-) -> None:
-    """资金费率实际对账 (2026-08-14 顶级交易所实践)。
-
-    `_estimate_funding_cost` 用"当前费率 × hold_hours/8"连续近似，但实际资金费
-    是每 8h 按当时费率离散结算、费率会漂移 → 48h 时间止损的成本判断可能失真。
-    本函数从 OKX 账单拉取该持仓开仓以来的实际资金费流水（billType=8 资金费，
-    subType=173 支出 / 174 收入，金额在 pnl 字段），与估算值对账。
-
-    仅记录偏差、不改变交易决策（read-only）；仅实盘（非 dry_run）执行。
-    """
-    if config.get("agent", {}).get("dry_run", False):
-        return
-    _rc_cfg = (config.get("agent", {}) or {}).get("reconciliation", {}) or {}
-    if not _rc_cfg.get("funding_fee_enabled", True):
-        return
-    if not positions:
-        return
-    _now_ms = int(time.time() * 1000)
-    for _inst, _pos in positions.items():
-        try:
-            _size = float(_pos.get("size", 0) or 0)
-            _avg_px = float(_pos.get("avg_px", 0) or 0)
-            _side = str(_pos.get("pos_side", "long") or "long")
-            _ctime_s = float(_pos.get("c_time", 0) or 0)
-            if _size <= 0 or _avg_px <= 0 or _ctime_s <= 0:
-                continue
-            _begin = str(int(_ctime_s * 1000))
-            _bills = client.get_bills(
-                inst_type="SWAP", limit=100, begin=_begin,
-                end=str(_now_ms), bill_type="8")
-            _actual = 0.0
-            _n = 0
-            for _b in (_bills or []):
-                if str(_b.get("instId", "")) != _inst:
-                    continue
-                try:
-                    _actual += float(_b.get("pnl", 0) or 0)
-                except (TypeError, ValueError):
-                    continue
-                _n += 1
-            _hold_hours = (_now_ms / 1000.0 - _ctime_s) / 3600.0
-            if _hold_hours <= 0:
-                continue
-            _est = _estimate_funding_cost(
-                client, _inst, _size, _avg_px, _hold_hours, pos_side=_side)
-            _diff = _actual - _est
-            _msg = (f"[FundingReconcile] {_inst} {_side} 持仓 {_hold_hours:.1f}h: "
-                    f"实际资金费 {_actual:+.4f} vs 估算 {_est:+.4f} "
-                    f"偏差 {_diff:+.4f} USDT ({_n} 笔结算)")
-            if abs(_diff) < max(0.5, abs(_est) * 0.5):
-                logger.info(_msg)
-            else:
-                logger.warning(_msg + " — 估算失真，时间止损成本判断需复核")
-        except (ConnectionError, TimeoutError, OSError, ValueError,
-                TypeError, OKXQueryError) as _e:
-            logger.debug(f"[FundingReconcile] {_inst} 对账失败(忽略): {_e}")
-            continue
-
-
-def _startup_reconciliation(
-    client: "OKXClient",
-    state_manager,
-    config: dict,
-    trailing_algo_ids: Dict[str, str],
-    last_submitted_sl: Dict[str, float],
-) -> None:
-    """启动三方对账 (2026-08-14): 交易所持仓 ↔ 本地 active_signals ↔ 保护单。
-
-    顶级交易所风控要求启动时先对账，否则重启后可能出现：
-      - 本地 active_signals 残留已平仓条目 → 换仓/风控误判
-      - 保护单未登记 → trailing 重复挂单 / 新仓裸奔
-      - 孤儿保护单残留 → 错误价位触发
-
-    read-only + 登记跟踪表，不做任何撤单/平仓（破坏性动作留给运行时 trailing 自愈）。
-    仅实盘（非 dry_run）执行。
-    """
-    if config.get("agent", {}).get("dry_run", False):
-        return
-    _rc_cfg = (config.get("agent", {}) or {}).get("reconciliation", {}) or {}
-    if not _rc_cfg.get("startup_enabled", True):
-        return
-
-    try:
-        positions = client.get_positions()
-    except Exception as _e:
-        logger.warning(f"[Reconcile] 启动对账 get_positions 失败: {_e}")
-        return
-    if positions is None:
-        logger.warning("[Reconcile] 启动对账 get_positions 返回 None (fail-closed)，跳过")
-        return
-
-    live_pos = {
-        str(p.get("instId", "")): p
-        for p in positions
-        if float(p.get("pos", "0") or 0) != 0
-    }
-
-    # 1) 本地 active_signals 对齐: 清理交易所已无持仓的残留条目
-    for _key in list(state_manager.state.active_signals.keys()):
-        _sig = state_manager.state.active_signals.get(_key, {}) or {}
-        _inst = str(_sig.get("inst_id") or _sig.get("instId", ""))
-        if _inst and _inst not in live_pos:
-            logger.warning(f"[Reconcile] 清理本地残留信号 {_inst} (交易所已无持仓)")
-            del state_manager.state.active_signals[_key]
-
-    # 2) 拉取全部生效保护单（oco/conditional）
-    _prot_by_inst: Dict[str, dict] = {}
-    for _ot in ("oco", "conditional"):
-        try:
-            _orders = client.get_algo_orders(inst_type="SWAP", ord_type=_ot) or []
-        except Exception as _e:
-            logger.debug(f"[Reconcile] 查询保护单 {_ot} 失败: {_e}")
-            _orders = []
-        for _a in _orders:
-            if _a.get("state") not in ("live", "effective"):
-                continue
-            _inst = str(_a.get("instId", ""))
-            if _inst:
-                _prot_by_inst.setdefault(_inst, _a)
-
-    # 3) 持仓 ↔ 保护单核对
-    for _inst, _p in live_pos.items():
-        _side = str(_p.get("posSide", "") or "")
-        _prot = _prot_by_inst.get(_inst)
-        if not _prot:
-            logger.warning(
-                f"[Reconcile] {_inst} {_side} 有持仓但无生效保护单 — "
-                f"首轮 trailing 将补挂，请确认")
-            continue
-        _a_side = str(_prot.get("posSide", "") or "")
-        if _a_side in ("", _side):
-            _aid = _prot.get("algoId", "")
-            trailing_algo_ids[_inst] = _aid
-            try:
-                last_submitted_sl[_inst] = float(
-                    _prot.get("slTriggerPx", 0) or 0)
-            except (TypeError, ValueError):
-                last_submitted_sl[_inst] = 0.0
-            logger.info(
-                f"[Reconcile] {_inst} {_side} 保护单 {_aid} 已登记 "
-                f"(SL={_prot.get('slTriggerPx')} TP={_prot.get('tpTriggerPx')})")
-        else:
-            logger.warning(
-                f"[Reconcile] {_inst} 保护单 posSide={_a_side} ≠ 持仓 {_side}，"
-                f"未登记（交由运行时自愈）")
-
-    # 4) 有保护单但无持仓 → 孤儿单告警
-    for _inst, _prot in _prot_by_inst.items():
-        if _inst not in live_pos:
-            logger.warning(
-                f"[Reconcile] {_inst} 存在生效保护单 {_prot.get('algoId', '')} "
-                f"但无持仓 — 疑似孤儿保护单，运行时 trailing 将处理")
-
-
 def _estimate_fee_cost(
     client: "OKXClient",
     inst_id: str,
@@ -2051,57 +1898,6 @@ def _update_mfe_mae_quant(
             logger.debug(f"[SignalTracker] MFE/MAE 更新失败 {inst_id}: {e}")
 
 
-def _vol_targeting_scale(
-    candles_1h: List[Candle],
-    entry_price: float,
-    config: dict,
-) -> float:
-    """波动率目标仓位缩放因子 (2026-08-14 顶级量化实践)。
-
-    顶级基金用 vol targeting 让每笔的期望波动贡献恒定：ATR% 高的币降仓、
-    ATR% 低的币升仓。缩放因子 = target_vol_pct / atr_pct，裁剪到
-    [min_scale, max_scale]。1H K 线不足时返回 1.0（不缩放，fail-open）。
-
-    缩放作用于 margin_pct（保证金比例），使满倍率模式下高波动币实际
-    占用更少保证金、低波动币用满，避免风险敞口随币种波动率漂移。
-
-    Returns:
-        缩放因子 (min_scale ~ max_scale)，数据不足返回 1.0
-    """
-    _vt_cfg = (config.get("risk", {}) or {}).get("vol_targeting", {}) or {}
-    if not _vt_cfg.get("enabled", True):
-        return 1.0
-    _target = float(_vt_cfg.get("target_vol_pct", 2.0) or 0)
-    _min_s = float(_vt_cfg.get("min_scale", 0.5) or 0.5)
-    _max_s = float(_vt_cfg.get("max_scale", 1.5) or 1.5)
-    if _target <= 0 or entry_price <= 0:
-        return 1.0
-    _period = int(config.get("strategy", {}).get("atr_period", 14) or 14)
-    if not candles_1h or len(candles_1h) < _period + 1:
-        return 1.0
-    try:
-        _trs = []
-        for i in range(1, len(candles_1h)):
-            h = float(candles_1h[i].high)
-            l = float(candles_1h[i].low)
-            pc = float(candles_1h[i - 1].close)
-            _trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-        if not _trs:
-            return 1.0
-        _atr = float(np.mean(_trs[:_period]))
-        for i in range(_period, len(_trs)):
-            _atr = (_atr * (_period - 1) + _trs[i]) / _period
-        if _atr <= 0:
-            return 1.0
-        _atr_pct = _atr / entry_price * 100.0
-        if _atr_pct <= 0:
-            return 1.0
-        _scale = _target / _atr_pct
-        return max(_min_s, min(_max_s, _scale))
-    except (ValueError, TypeError, ZeroDivisionError, IndexError):
-        return 1.0
-
-
 def _execute_signal_with_quant_enhancements(
     client: OKXClient,
     signal: Signal,
@@ -2172,22 +1968,23 @@ def _execute_signal_with_quant_enhancements(
         return None
 
     exec_config = copy.deepcopy(config)
-    # 波动率目标仓位 (2026-08-14 顶级量化实践): ATR% 高的币降保证金、
-    # ATR% 低的币用满，避免风险敞口随币种波动率漂移。作用于 margin_pct。
-    try:
-        _vt_scale = _vol_targeting_scale(
-            candles_1h, float(signal.entry_price or 0), config)
-        if _vt_scale != 1.0 and "risk" in exec_config:
-            _orig_margin = float(
-                exec_config["risk"].get("margin_pct", 30.0) or 0)
-            _new_margin = _orig_margin * _vt_scale
-            exec_config["risk"]["margin_pct"] = _new_margin
-            logger.info(
-                f"[VolTarget] {signal.inst_id} 波动率目标缩放 "
-                f"{_vt_scale:.2f}×: margin_pct {_orig_margin:.0f}% → "
-                f"{_new_margin:.1f}% (ATR% 偏离目标)")
-    except Exception as _vt_e:
-        logger.debug(f"[VolTarget] {signal.inst_id} 缩放失败(放行): {_vt_e}")
+    # 波动率目标仓位 (v3.3 / PRO): ATR% 高的币降保证金、ATR% 低的币用满。
+    # 开源核心版自动跳过（不缩放）。
+    if _PRO is not None:
+        try:
+            _vt_scale = _PRO.vol_targeting_scale(
+                candles_1h, float(signal.entry_price or 0), config)
+            if _vt_scale != 1.0 and "risk" in exec_config:
+                _orig_margin = float(
+                    exec_config["risk"].get("margin_pct", 30.0) or 0)
+                _new_margin = _orig_margin * _vt_scale
+                exec_config["risk"]["margin_pct"] = _new_margin
+                logger.info(
+                    f"[VolTarget] {signal.inst_id} 波动率目标缩放 "
+                    f"{_vt_scale:.2f}×: margin_pct {_orig_margin:.0f}% → "
+                    f"{_new_margin:.1f}% (ATR% 偏离目标)")
+        except Exception as _vt_e:
+            logger.debug(f"[VolTarget] {signal.inst_id} 缩放失败(放行): {_vt_e}")
     # 修复 P2-1: 接线 market_guard 的 WARNING 减仓因子（此前从未被调用，
     # WARNING 状态——资金费极端/OI 异常——不产生任何仓位缩放）。
     # CRISIS 由 can_open_new_position 硬拦截，WARNING 走减半仓。
@@ -2995,13 +2792,14 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
         state_manager.update_equity(equity)
         logger.info(f"Initial equity: {equity:.2f} USDT")
 
-    # ---- 启动三方对账 (2026-08-14): 交易所持仓 ↔ 本地状态 ↔ 保护单 ----
-    # 仅实盘执行；纸面模式（dry_run）内部直接 return。
-    try:
-        _startup_reconciliation(
-            client, state_manager, config, trailing_algo_ids, _last_submitted_sl)
-    except Exception as _rc_e:
-        logger.warning(f"[Reconcile] 启动对账异常(忽略): {_rc_e}")
+    # ---- 启动三方对账 (v3.3 / PRO 模块): 交易所持仓 ↔ 本地状态 ↔ 保护单 ----
+    # 开源核心版自动跳过。
+    if _PRO is not None:
+        try:
+            _PRO.startup_reconciliation(
+                client, state_manager, config, trailing_algo_ids, _last_submitted_sl)
+        except Exception as _rc_e:
+            logger.warning(f"[Reconcile] 启动对账异常(忽略): {_rc_e}")
 
     round_count = 0
     trade_count_since_reflection = 0
@@ -3290,18 +3088,19 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
             continue
         active_count = len([p for p in positions.values() if p["size"] > 0])
 
-        # ---- 步骤 1.2: 资金费率实际对账（低频，仅持仓时） ----
+        # ---- 步骤 1.2: 资金费率实际对账 (v3.3 / PRO, 低频仅持仓时) ----
         _recon_cfg = (config.get("agent", {}) or {}).get("reconciliation", {}) or {}
         try:
             _ff_interval = max(1, int(_recon_cfg.get(
                 "funding_fee_interval_rounds", 6) or 6))
         except (TypeError, ValueError):
             _ff_interval = 6
-        if (active_count > 0
+        if (active_count > 0 and _PRO is not None
                 and not config.get("agent", {}).get("dry_run", False)
                 and round_count % _ff_interval == 0):
             try:
-                _reconcile_funding_fees(client, positions, config)
+                _PRO.reconcile_funding_fees(
+                    client, positions, config, _estimate_funding_cost)
             except Exception as _ff_e:
                 logger.debug(f"[FundingReconcile] 对账异常(忽略): {_ff_e}")
 
@@ -5493,27 +5292,27 @@ def main_loop(config: dict, once: bool = False, max_rounds: int = 0):
                     best_signal.leverage = effective_leverage
                     eff_risk = _eff_risk
 
-                # ---- 滚动 Kelly 风险上限 (2026-08-15 翻倍协议: 探索→利用) ----
-                # eff_risk = min(自适应风险, 滚动分数Kelly)。无论 adaptive_tuner
-                # 是否启用都生效；样本不足(返回 None)时保持原值不引入噪声。
-                # 档位: <50 笔 1/4 Kelly(探索), ≥50 笔 1/2 Kelly(利用)。
-                try:
-                    with state_manager.lock():
-                        _rk_pnl = list(state_manager.state.recent_pnl or [])
-                    _kelly_cap, _kdiag = rolling_kelly_risk_pct(
-                        _rk_pnl, float(risk_cfg["risk_per_trade_pct"]), risk_cfg)
-                except Exception as _rk_e:
-                    _kelly_cap, _kdiag = None, {"error": str(_rk_e)}
-                    logger.debug(f"[RollingKelly] 计算失败(忽略): {_rk_e}")
-                if _kelly_cap is not None and _kelly_cap < eff_risk:
-                    _ewma = _kdiag.get("ewma_lambda") or 0
-                    logger.info(
-                        f"[RollingKelly] 风险上限 {eff_risk:.1f}% → "
-                        f"{_kelly_cap:.1f}% (f*={_kdiag.get('kelly_f')} "
-                        f"样本={_kdiag.get('samples')} 胜率={_kdiag.get('win_rate')} "
-                        f"档位={_kdiag.get('tier')}"
-                        + (f" ewmaλ={_ewma}" if _ewma else "") + ")")
-                    eff_risk = _kelly_cap
+                # ---- 滚动 Kelly 风险上限 (v3.3 / PRO: 探索→利用) ----
+                # eff_risk = min(自适应风险, 滚动分数Kelly)。开源核心版
+                # 自动跳过；样本不足(返回 None)时保持原值不引入噪声。
+                if _PRO is not None:
+                    try:
+                        with state_manager.lock():
+                            _rk_pnl = list(state_manager.state.recent_pnl or [])
+                        _kelly_cap, _kdiag = _PRO.rolling_kelly_risk_pct(
+                            _rk_pnl, float(risk_cfg["risk_per_trade_pct"]), risk_cfg)
+                    except Exception as _rk_e:
+                        _kelly_cap, _kdiag = None, {"error": str(_rk_e)}
+                        logger.debug(f"[RollingKelly] 计算失败(忽略): {_rk_e}")
+                    if _kelly_cap is not None and _kelly_cap < eff_risk:
+                        _ewma = _kdiag.get("ewma_lambda") or 0
+                        logger.info(
+                            f"[RollingKelly] 风险上限 {eff_risk:.1f}% → "
+                            f"{_kelly_cap:.1f}% (f*={_kdiag.get('kelly_f')} "
+                            f"样本={_kdiag.get('samples')} 胜率={_kdiag.get('win_rate')} "
+                            f"档位={_kdiag.get('tier')}"
+                            + (f" ewmaλ={_ewma}" if _ewma else "") + ")")
+                        eff_risk = _kelly_cap
 
                 # 使用配置副本应用风险比例，避免修改共享 config
                 if eff_risk != float(risk_cfg["risk_per_trade_pct"]):

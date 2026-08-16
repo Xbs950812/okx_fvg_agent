@@ -12,7 +12,6 @@ OKX API v5 Client — 基于官方 python-okx SDK (v0.4.3) 封装。
 import json
 import logging
 import math
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -51,44 +50,9 @@ class OKXQueryError(Exception):
 _RETRYABLE_CODES = {"50011", "50012", "50013", "50000"}
 _RETRY_DELAYS = (0.5, 1.5, 4.0)
 
-# 全局 API 限流令牌桶（由 OKXClient 初始化，模块级共享给 _call_sdk_retry）。
-# 0 表示未启用（dry_run 或未配置时不限流）。
-_GLOBAL_RATE_LIMITER: Optional["_TokenBucket"] = None
-
-
-class _TokenBucket:
-    """全局 API 限流令牌桶 (2026-08-14 顶级交易所实践)。
-
-    主动控制请求频率，避免触发 OKX 429 限流被降权。与 _call_sdk_retry
-    的被动重试互补：令牌桶在源头削峰，重试兜底偶发失败。
-
-    算法: 经典令牌桶，capacity 为突发容量，rate 为每秒补充令牌数。
-    acquire() 无令牌时阻塞等待，保证 QPS 不超过配置值。
-    """
-
-    def __init__(self, rate: float, capacity: float):
-        self.rate = max(0.1, float(rate))
-        self.capacity = max(1.0, float(capacity))
-        self._tokens = self.capacity
-        self._last = time.time()
-        self._lock = threading.Lock()
-
-    def acquire(self):
-        """获取一个令牌（无令牌时阻塞至补充）。"""
-        while True:
-            with self._lock:
-                now = time.time()
-                self._tokens = min(
-                    self.capacity,
-                    self._tokens + (now - self._last) * self.rate,
-                )
-                self._last = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                # 计算还需等待的秒数，缩小锁内休眠窗口
-                wait = (1.0 - self._tokens) / self.rate
-            time.sleep(min(wait, 0.2))
+# 全局 API 限流令牌桶（PRO 模块可选启用；由 fvg_killer_pro.create_rate_limiter
+# 在 OKXClient.__init__ 中赋值）。None = 未启用（dry_run 或开源核心版）。
+_GLOBAL_RATE_LIMITER = None
 
 
 def _call_sdk_retry(fn, *args, retries: int = 3, **kwargs):
@@ -204,23 +168,16 @@ class OKXClient:
         self._lsr_cache: Dict[str, Tuple[float, float]] = {}
         self._lsr_cache_ttl = 600.0  # 10 分钟
 
-        # 全局 API 限流令牌桶 (2026-08-14 顶级交易所实践)：主动控制 QPS，
-        # 避免触发 OKX 429 降权。模块级单例，dry_run 模拟盘不启用（其下单/持仓
-        # 端点走本地假数据，仅剩低频行情调用，已被 coin_tracker 批间隔节流）。
+        # 全局 API 限流令牌桶 (v3.3 / PRO 模块): 实盘模式按 okx.rate_limit
+        # 启用主动 QPS 控制。开源核心版（无 fvg_killer_pro）不限流。
         global _GLOBAL_RATE_LIMITER
-        _rl_cfg = (cfg.get("rate_limit") or {}) if isinstance(cfg.get("rate_limit"), dict) else {}
-        if (not self.dry_run) and _rl_cfg.get("enabled", True):
-            try:
-                _qps = float(_rl_cfg.get("max_qps", 10) or 10)
-                _burst = float(_rl_cfg.get("burst_capacity", 20) or 20)
-                _GLOBAL_RATE_LIMITER = _TokenBucket(_qps, _burst)
-                logger.info(
-                    f"[RateLimit] 全局令牌桶已启用: {_qps:.1f} QPS, "
-                    f"突发容量 {_burst:.0f}")
-            except (TypeError, ValueError):
-                _GLOBAL_RATE_LIMITER = None
-        else:
-            _GLOBAL_RATE_LIMITER = None
+        _GLOBAL_RATE_LIMITER = None
+        try:
+            from fvg_killer_pro import create_rate_limiter
+            _GLOBAL_RATE_LIMITER = create_rate_limiter(
+                cfg.get("rate_limit") or {}, self.dry_run)
+        except ImportError:
+            pass
 
     # ------------------------------------------------------------------
     # 内部辅助方法

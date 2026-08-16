@@ -21,6 +21,13 @@ from typing import Optional, List, Dict, Tuple
 from okx_client import OKXClient, OKXQueryError
 from strategy import Signal
 
+# PRO 模块（可选）: 订单簿流动性检查等 v3.3 增强功能。
+# 开源核心版无 fvg_killer_pro 时自动降级到 v3.2 行为。
+try:
+    import fvg_killer_pro as _PRO
+except ImportError:
+    _PRO = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -381,59 +388,6 @@ def calculate_position_size(
     return sz, margin
 
 
-def check_order_book_liquidity(
-    client,
-    inst_id: str,
-    pos_side: str,
-    notional_usd: float,
-    ct_val: float,
-    config: dict,
-) -> Tuple[bool, str]:
-    """开仓前订单簿深度/流动性检查 (2026-08-14 顶级交易所实践)。
-
-    名义仓位相对前 N 档对侧深度过大时，平仓市价兜底会吃掉多档、滑点
-    远超成本模型估算（尤其涨跌幅榜中盘小币订单簿薄）。对侧含义:
-      - 做多(long) → 平仓时卖出吃 bids 深度
-      - 做空(short) → 平仓时买入吃 asks 深度
-
-    门槛: notional / 对侧深度 > max_notional_depth_ratio → 拒绝开仓。
-    默认 5%（名义仓位不得超过对侧前 N 档深度的 5%），保守起见超限直接
-    拒绝而非降仓（降仓会让风控口径与满倍率模式不一致）。
-
-    查询失败返回 ok=True（fail-open，不阻塞开仓）——流动性检查是增强
-    门，不是核心风控闸；订单簿偶发不可得时不应让账户空转。
-
-    Returns:
-        (ok, reason) — ok=False 表示流动性不足，应拒绝开仓
-    """
-    _ob_cfg = (config.get("risk", {}) or {}).get("order_book_depth", {}) or {}
-    if not _ob_cfg.get("enabled", True):
-        return True, ""
-    _max_ratio = float(_ob_cfg.get("max_notional_depth_ratio", 0.05) or 0)
-    _levels = int(_ob_cfg.get("depth_levels", 10) or 10)
-    if _max_ratio <= 0 or notional_usd <= 0:
-        return True, ""
-    try:
-        _depth = client.get_order_book_depth_usd(
-            inst_id, levels=_levels, ct_val=ct_val)
-    except Exception as _e:
-        logger.warning(f"[Liquidity] {inst_id} 订单簿深度查询失败，放行: {_e}")
-        return True, ""
-    if not _depth:
-        return True, ""
-    _side_depth = (_depth.get("bids_usd", 0.0) if pos_side == "long"
-                   else _depth.get("asks_usd", 0.0))
-    if _side_depth <= 0:
-        return True, ""
-    _ratio = notional_usd / _side_depth
-    if _ratio > _max_ratio:
-        return False, (
-            f"[Liquidity] {inst_id} 名义 {notional_usd:.2f} USDT / 对侧前 "
-            f"{_levels} 档深度 {_side_depth:.2f} USDT = {_ratio:.1%} "
-            f"> {_max_ratio:.0%}，订单簿过薄，拒绝开仓")
-    return True, ""
-
-
 # ---------------------------------------------------------------------------
 # 订单执行
 # ---------------------------------------------------------------------------
@@ -633,15 +587,16 @@ def execute_signal(
         side = "sell"
         pos_side = "short"
 
-    # ---- 开仓前订单簿深度/流动性检查 (2026-08-14 顶级交易所实践) ----
+    # ---- 开仓前订单簿深度/流动性检查 (v3.3 / PRO 模块) ----
     # 名义仓位相对对侧前 N 档深度比例过大 → 订单簿过薄，平仓滑点远超估算。
-    # 放在计算完 sz/notional 之后、下单之前，覆盖直接开仓与换仓/反手路径。
-    _notional_usd = float(sz) * float(ct_val) * float(signal.entry_price)
-    _liq_ok, _liq_reason = check_order_book_liquidity(
-        client, signal.inst_id, pos_side, _notional_usd, ct_val, config)
-    if not _liq_ok:
-        logger.info(_liq_reason)
-        return None
+    # 开源核心版（无 PRO 模块）自动跳过此检查。
+    if _PRO is not None:
+        _notional_usd = float(sz) * float(ct_val) * float(signal.entry_price)
+        _liq_ok, _liq_reason = _PRO.check_order_book_liquidity(
+            client, signal.inst_id, pos_side, _notional_usd, ct_val, config)
+        if not _liq_ok:
+            logger.info(_liq_reason)
+            return None
 
     # ---- 格式化价格精度 ----
     # OKX 要求价格和数量为字符串

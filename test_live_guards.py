@@ -27,8 +27,9 @@ from types import SimpleNamespace
 import pytest
 
 import okx_client
-from okx_client import OKXClient, _call_sdk_retry, _TokenBucket
-from executor import check_order_book_liquidity, execute_signal
+from okx_client import OKXClient, _call_sdk_retry
+from fvg_killer_pro import _TokenBucket, check_order_book_liquidity
+from executor import execute_signal
 
 
 @pytest.fixture(autouse=True)

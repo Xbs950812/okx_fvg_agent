@@ -34,7 +34,7 @@ import sys
 import time
 from collections import deque
 
-from hyperopt import rolling_kelly_risk_pct
+from fvg_killer_pro import rolling_kelly_risk_pct
 
 PASS, FAIL = 0, 0
 

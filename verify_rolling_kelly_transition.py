@@ -22,7 +22,7 @@ import os
 import tempfile
 
 from executor import StateManager
-from hyperopt import rolling_kelly_risk_pct
+from fvg_killer_pro import rolling_kelly_risk_pct
 
 BASE_RISK = 30.0          # config risk.risk_per_trade_pct（满倍率基准）
 WIN_PNL, LOSS_PNL = 2.5, -1.0   # b = 2.5 / 1.0 = 2.5

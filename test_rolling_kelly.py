@@ -29,7 +29,8 @@ import math
 
 import pytest
 
-from hyperopt import compute_kelly, rolling_kelly_risk_pct
+from hyperopt import compute_kelly
+from fvg_killer_pro import rolling_kelly_risk_pct
 from optimization import TradeRecord
 from executor import StateManager
 
