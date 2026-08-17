@@ -39,6 +39,9 @@ models/
 # 临时检查脚本
 _inspect_state.py
 
+# 本地推广文案（含发帖节奏，仅作者使用）
+PROMO_POSTS.md
+
 # Python 缓存
 __pycache__/
 *.pyc
