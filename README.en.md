@@ -18,6 +18,21 @@ An automated Fair Value Gap (FVG) trading agent for OKX perpetual futures, disti
 >
 > **Not financial advice. Leveraged futures trading can lose your entire capital.**
 
+> **One-liner**: hunts Fair Value Gaps born from volatility shocks — 3σ anomaly
+> detection + ICT three-candle gaps + five-channel analysis + multi-agent
+> debate + a rolling-Kelly risk engine + live guards. 197 unit tests,
+> Monte Carlo validated.
+
+## Architecture
+
+![System architecture](docs/images/architecture.png)
+
+Four-layer pipeline: **data/research** (WS tickers + top-100 background
+tracking + 3σ anomaly + ICT gap detection) → **analysis** (five channels +
+multi-agent debate + regime/factors) → **risk** (rolling Kelly + order-book
+depth + market circuit breakers + rate limiter) → **execution** (limit
+entries at FVG boundaries + OCO protection + reconciliation + royalty).
+
 ## What It Does
 
 1. **Anomaly detection** — flags candles with ≥3σ price moves + 5× volume spikes
@@ -43,6 +58,17 @@ sequences for both strategies; the chart is generated from the exact same
 code path as the verification script (`verify_kelly_monte_carlo.py`,
 300 paths × 1000 trades, including edge-decay robustness scenarios — see
 [USAGE.md](docs/USAGE.md#7-测试与验证)).
+
+**Full validation results** (300 paths × 1000 trades, incl. edge drift):
+
+| Scenario | Rolling Kelly | Fixed 30% risk |
+|----------|---------------|----------------|
+| Stable edge (p=0.5, b=2.5) | ~20% slower growth (the price of 15–20pp shallower drawdowns) | faster growth |
+| Edge decays (p 0.5→0.4) | median maxDD **83.1%** | median maxDD **100%** (ruin) |
+| Edge vanishes (p 0.5→0.25) | **+27 doublings, survives** | ruined (2⁻²¹) |
+| Tier jump at trade #50 (1/4→1/2 Kelly) | maxDD delta **0.0%** (statistically invisible) | — |
+
+Reproduce edge drift: `python verify_kelly_monte_carlo.py --drift 0.5 0.4`
 
 ## Royalty — 10% Profit Sharing
 
@@ -97,6 +123,23 @@ Aggressiveness levels: `1` = aggressive (forces a position daily),
 Full configuration reference: [README.md](README.md#配置说明) (Chinese) ·
 Usage guide: [docs/USAGE.md](docs/USAGE.md) · Troubleshooting:
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+
+## Sample Log Output
+
+Real production log excerpt (live guards active, 2026-08-14) — the bot
+says **no** 99% of the time; five gates reject unqualified signals one by
+one (log messages are in Chinese):
+
+```text
+──────────────────────────────────────────────────
+  ROUND 8  2026-08-14 09:28 UTC
+──────────────────────────────────────────────────
+[Freshness] SNXX-USDT-SWAP 1H FVG 距最新 K 线 186 根 > 24，已过期，丢弃信号   # stale gap
+[ATRGrade]  SNXX-USDT-SWAP 1H FVG 宽度 0.16 / ATR 0.37 = 0.43 < 0.5，丢弃信号 # weak gap (grade C)
+[MoverDir]  ETHFI-USDT-SWAP 4H long 被方向门禁否决: 涨幅榜币 24h +14.4% 暴涨，禁追多 # no chasing pumps
+[DepthGate] EDEN-USDT-SWAP long 挂单价偏离现价 6.06% > 5.0% 方向矛盾，回退 FVG 回补位
+[DepthGate] LAB-USDT-SWAP short FVG 回补位仍偏离 11.32% > 5.0%，方向矛盾否决信号
+```
 
 ## Project Structure
 
