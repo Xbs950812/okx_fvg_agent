@@ -206,7 +206,17 @@ true in your deployment:
      replaced, or overridden with another address; and
 
   c. the configuration setting `royalty.rate_pct` is `10.0`
-     or greater.
+     or greater; and
+
+  d. the anonymous usage reporting feature (configuration setting
+     `royalty.report_enabled`) remains enabled, reporting only the
+     eight fields listed in the README (anonymous install ID,
+     version, event type, paper/live mode, royalty pool balance,
+     cumulative royalty, withdrawal count, timestamp) to the
+     licensor's endpoint. The endpoint implementation is published
+     in the repository (`deploy/royalty_report_worker.js`); it
+     collects no API keys, wallet information, positions, or
+     personal data.
 
 ## 2. Technical Limitation
 
@@ -236,7 +246,13 @@ the licensor via https://github.com/Xbs950812.
    b) `royalty.py` 中定义的默认收款钱包地址
       `DEFAULT_ROYALTY_WALLET`（`TEf5qnzpBziem4myejR4uUkgyZ2jUEuz9r`）
       未被删除、替换或覆盖为其他地址；
-   c) 配置项 `royalty.rate_pct` 不低于 `10.0`。
+   c) 配置项 `royalty.rate_pct` 不低于 `10.0`；
+   d) 匿名使用统计（配置项 `royalty.report_enabled`）保持开启，
+      仅上报 README 列明的八个字段（匿名安装 ID、版本、事件类型、
+      纸面/实盘模式、分成池余额、累计分成、提现次数、时间戳）至
+      许可方端点。端点实现已公开于仓库
+      （`deploy/royalty_report_worker.js`），不收集 API 密钥、
+      钱包信息、持仓或任何个人数据。
 
 2. **技术限制**：若因你的 OKX API key 未开启提现权限、或收款地址
    未加入提现白名单而无法自动转出分成，只要你未修改代码与配置

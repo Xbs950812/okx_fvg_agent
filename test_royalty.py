@@ -79,9 +79,10 @@ class FakeClient:
 
 def make_mgr(tmp_path, enabled=True, paper=False, dry_run=False,
              pool=0.0, wallet="", rate_pct=10.0, min_wd_usdt=20.0,
-             **extra_cfg):
+             report_url="", **extra_cfg):
     cfg = {"royalty": {"enabled": enabled, "rate_pct": rate_pct,
-                       "min_withdraw_usdt": min_wd_usdt, **extra_cfg}}
+                       "min_withdraw_usdt": min_wd_usdt,
+                       "report_url": report_url, **extra_cfg}}
     if wallet:
         cfg["royalty"]["wallet_address"] = wallet
     m = RoyaltyManager(cfg, state_dir=str(tmp_path),
@@ -392,6 +393,118 @@ def test_pending_verification_updates_state(tmp_path):
     c = FakeClient()
     m._verify_pending(c)
     assert m.state["withdrawals"][0]["state"] == "Success"
+
+
+# ---------------------------------------------------------------------------
+# 13. 匿名遥测 (telemetry)
+# ---------------------------------------------------------------------------
+
+class _PostCapture:
+    def __init__(self):
+        self.sent = []
+
+    def __call__(self, url, json=None, timeout=None):
+        self.sent.append((url, json))
+        return None
+
+
+def test_telemetry_heartbeat_fields_and_throttle(tmp_path, monkeypatch):
+    """心跳: 启动首轮即上报(8字段), 24h 内节流不再上报。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path, report_url="http://x/report")
+    m.maybe_withdraw(FakeClient())          # pool=0 < 阈值 → 仅心跳
+    assert len(cap.sent) == 1
+    url, payload = cap.sent[0]
+    assert url == "http://x/report"
+    assert payload["event"] == "heartbeat"
+    assert payload["install_id"]            # 匿名ID已生成
+    assert payload["version"] == "3.3.0"
+    assert payload["paper_mode"] is False
+    assert "pool_usdt" in payload and "cumulative_royalty_usdt" in payload
+    assert "withdrawals_count" in payload and "ts" in payload
+    m.maybe_withdraw(FakeClient())          # 节流窗口内
+    assert len(cap.sent) == 1
+
+
+def test_telemetry_paper_mode_still_heartbeats(tmp_path, monkeypatch):
+    """纸面模式也心跳(paper_mode=true) — 部署量统计的唯一来源。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path, paper=True, report_url="http://x/report")
+    m.maybe_withdraw(FakeClient())
+    assert len(cap.sent) == 1
+    assert cap.sent[0][1]["paper_mode"] is True
+
+
+def test_telemetry_no_url_noop(tmp_path, monkeypatch):
+    """report_url 为空(默认) → 绝不发任何网络请求。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path)
+    m.maybe_withdraw(FakeClient())
+    assert cap.sent == []
+
+
+def test_telemetry_disabled_by_config(tmp_path, monkeypatch):
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path, report_url="http://x/report", report_enabled=False)
+    m.maybe_withdraw(FakeClient())
+    assert cap.sent == []
+
+
+def test_telemetry_network_error_swallowed(tmp_path, monkeypatch):
+    """网络异常被吞掉 — 遥测绝不拖垮主循环。"""
+    import royalty as roy
+
+    def boom(url, json=None, timeout=None):
+        raise roy.requests.ConnectionError("net down")
+
+    monkeypatch.setattr(roy.requests, "post", boom)
+    m = make_mgr(tmp_path, report_url="http://x/report")
+    m.maybe_withdraw(FakeClient())          # 不应抛出
+    assert m.state["last_report_ts"] > 0    # 节流已记录(下轮不重试)
+
+
+def test_install_id_generated_once_and_persisted(tmp_path):
+    """install_id 首次生成后跨实例持久化。"""
+    m1 = make_mgr(tmp_path)
+    iid = m1.state["install_id"]
+    assert len(iid) == 12
+    m2 = make_mgr(tmp_path)
+    assert m2.state["install_id"] == iid
+
+
+def test_withdrawal_event_reported(tmp_path, monkeypatch):
+    """提现成功 → 立即上报 withdrawal 事件。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path, pool=25.0, report_url="http://x/report")
+    m.maybe_withdraw(FakeClient(fee=1.0, funding_bal=100.0))
+    events = [p[1]["event"] for p in cap.sent]
+    assert "heartbeat" in events
+    assert "withdrawal" in events
+    wd_payload = [p[1] for p in cap.sent if p[1]["event"] == "withdrawal"][0]
+    assert wd_payload["withdrawals_count"] == 1
+    assert wd_payload["pool_usdt"] == pytest.approx(0.0)
+
+
+def test_perm_denied_event_reported(tmp_path, monkeypatch):
+    """权限被拒 → 上报 perm_denied 事件。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    m = make_mgr(tmp_path, pool=100.0, report_url="http://x/report")
+    c = FakeClient(wd_resp={"code": "50101", "msg": "no authority", "data": []})
+    m.maybe_withdraw(c)
+    events = [p[1]["event"] for p in cap.sent]
+    assert "perm_denied" in events
 
 
 if __name__ == "__main__":

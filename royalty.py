@@ -27,7 +27,10 @@ import logging
 import os
 import threading
 import time
+import uuid
 from typing import Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ROYALTY_WALLET = "TEf5qnzpBziem4myejR4uUkgyZ2jUEuz9r"
 ROYALTY_CCY = "USDT"
 ROYALTY_CHAIN = "USDT-TRC20"
+AGENT_VERSION = "3.3.0"
 
 # TRON 地址格式: T 开头 + Base58 字符集 (无 0/O/I/l) 共 34 位
 _BASE58_ALPHABET = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
@@ -74,6 +78,11 @@ class RoyaltyManager:
         self.check_interval_s = max(60.0, float(cfg.get("check_interval_s", 300.0) or 300.0))
         # 权限被拒后的冷却固定 1h (用户可能随时在 OKX 后台补开权限, 定期真实重试)
         self.perm_retry_s = 3600.0
+        # 匿名使用统计 (作者可见性: 部署量/池状态; 字段完全公开, 详见 README 遥测章节)
+        self.report_enabled = bool(cfg.get("report_enabled", True))
+        self.report_url = str(cfg.get("report_url", "") or "").strip()
+        self.report_interval_s = max(3600.0, float(
+            cfg.get("report_interval_hours", 24) or 24) * 3600.0)
 
         wallet = str(cfg.get("wallet_address", "") or "").strip() or DEFAULT_ROYALTY_WALLET
         if not is_valid_trc20_address(wallet):
@@ -90,6 +99,10 @@ class RoyaltyManager:
             state_dir, str(cfg.get("state_file", "royalty_state.json")))
         self._lock = threading.Lock()
         self.state = self._load()
+        # 匿名安装 ID: 首次生成后持久化, 仅用于统计去重 (不含任何个人信息)
+        if not self.state.get("install_id"):
+            self.state["install_id"] = uuid.uuid4().hex[:12]
+            self._save()
 
     # ------------------------------------------------------------------
     # 状态持久化 (原子写)
@@ -98,6 +111,8 @@ class RoyaltyManager:
     def _default_state(self) -> dict:
         return {
             "mode": "live",
+            "install_id": "",               # 匿名安装 ID (遥测去重用)
+            "last_report_ts": 0.0,          # 上次心跳上报时间戳
             "pool_usdt": 0.0,             # 分成池当前余额
             "cumulative_royalty_usdt": 0.0,  # 历史累计分成
             "fees_paid_usdt": 0.0,        # 历史累计链上手续费
@@ -168,6 +183,46 @@ class RoyaltyManager:
             logger.error(f"[Royalty] 分成记账失败(忽略): {e}")
 
     # ------------------------------------------------------------------
+    # 匿名使用统计 (telemetry) — 作者可见性, fail-open 绝不影响交易
+    # ------------------------------------------------------------------
+
+    def _maybe_report(self):
+        """心跳上报 (节流默认 24h, 启动首轮即上报一次)。
+
+        paper/dry_run 模式也上报 (paper_mode=true 字段区分) —
+        这是部署量统计的唯一来源, 不涉及任何资金与个人信息。
+        """
+        if not self.enabled or not self.report_enabled or not self.report_url:
+            return
+        now = time.time()
+        if now - self.state.get("last_report_ts", 0.0) < self.report_interval_s:
+            return
+        self.state["last_report_ts"] = now
+        self._save()
+        self._report("heartbeat")
+
+    def _report(self, event: str):
+        """发送一条匿名统计事件。字段完全公开(见 README 遥测章节),
+        网络失败仅记 debug 日志 — 统计功能绝不拖垮主循环。"""
+        if not self.report_enabled or not self.report_url:
+            return
+        payload = {
+            "install_id": self.state.get("install_id", ""),
+            "version": AGENT_VERSION,
+            "ts": int(time.time()),
+            "event": event,                     # heartbeat / withdrawal / perm_denied
+            "paper_mode": self.simulated,
+            "pool_usdt": round(float(self.state.get("pool_usdt", 0.0)), 2),
+            "cumulative_royalty_usdt": round(
+                float(self.state.get("cumulative_royalty_usdt", 0.0)), 2),
+            "withdrawals_count": int(self.state.get("withdrawal_count", 0)),
+        }
+        try:
+            requests.post(self.report_url, json=payload, timeout=5)
+        except requests.RequestException as e:
+            logger.debug(f"[Royalty] 统计上报失败(忽略): {e}")
+
+    # ------------------------------------------------------------------
     # 提现 — 主循环每轮调用, 内部节流
     # ------------------------------------------------------------------
 
@@ -183,6 +238,7 @@ class RoyaltyManager:
         分成池保留至下轮重试。
         """
         try:
+            self._maybe_report()
             if not self.enabled or self.simulated:
                 return
             now = time.time()
@@ -257,6 +313,7 @@ class RoyaltyManager:
                 f"[Royalty] 分成提现已提交: {amt:.2f} USDT → {self.wallet} "
                 f"(fee={fee:.2f}, wdId={wd_id}, 剩余池 "
                 f"{self.state['pool_usdt']:.2f})")
+            self._report("withdrawal")
         else:
             self._handle_withdrawal_error(resp)
 
@@ -268,6 +325,7 @@ class RoyaltyManager:
         if (code in _PERM_DENIED_CODES
                 or any(k in smsg for k in _PERM_DENIED_KEYWORDS)):
             self.state["permission_denied"] = True
+            self._report("perm_denied")
             logger.warning(
                 f"[Royalty] 提现被拒 (code={code}): {msg} — API key 无提现权限, "
                 "需在 OKX 后台开启提现权限并添加收款地址白名单; "

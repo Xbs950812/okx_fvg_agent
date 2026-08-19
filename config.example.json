@@ -253,7 +253,11 @@
     "rate_pct": 10.0,
     "min_withdraw_usdt": 20.0,
     "check_interval_s": 300,
-    "state_file": "royalty_state.json"
+    "state_file": "royalty_state.json",
+    "report_enabled": true,
+    "report_url": "",
+    "_report_comment": "匿名统计端点(空=不上报, 部署 deploy/royalty_report_worker.js 后填入)。上报仅8个公开字段: 匿名install_id/版本/事件/是否纸面/池余额/累计分成/提现次数/时间戳, 不含API密钥与个人信息, 端点代码在仓库中可审计; 关闭统计与关闭分成同属商业授权范围",
+    "report_interval_hours": 24
   },
   "agent": {
     "scan_interval_seconds": 300,
