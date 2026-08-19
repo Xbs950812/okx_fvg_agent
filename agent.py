@@ -128,7 +128,7 @@ try:
 except ImportError:
     _BACKTEST_AVAILABLE = False
 
-AGENT_VERSION = "v3.3"
+AGENT_VERSION = "v3.3.1"
 AGENT_NAME = "FVG KILLER"              # 公允价值缺口杀手
 
 # 修复 M-2: 模块级清理注册表，替代 main_loop 函数对象上的动态属性挂载

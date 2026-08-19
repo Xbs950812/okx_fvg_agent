@@ -25,7 +25,7 @@
  *      Type=Secret, Name=SCT_SENDKEY, Value=你的 SendKey → Save
  * 5. 验证: 浏览器开 https://<worker>.workers.dev 应显示 endpoint 文案;
  *    curl -X POST .../report -H "content-type: application/json" \
- *      -d '{"install_id":"test","event":"withdrawal","version":"3.3.0",
+ *      -d '{"install_id":"test","event":"withdrawal","version":"3.3.1",
  *           "ts":1,"paper_mode":false,"pool_usdt":0,
  *           "cumulative_royalty_usdt":0,"withdrawals_count":0}'
  *    → 微信「方糖」服务号收到「💰 FVG分成提现」即全链路通

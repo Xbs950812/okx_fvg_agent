@@ -34,8 +34,8 @@ body:
     id: version
     attributes:
       label: 版本 / Version
-      description: 如 v3.3.0（git log -1 或 README 版本号）
-      placeholder: v3.3.0
+      description: 如 v3.3.1（git log -1 或 README 版本号）
+      placeholder: v3.3.1
 
   - type: dropdown
     id: mode
