@@ -256,7 +256,7 @@
     "state_file": "royalty_state.json",
     "report_enabled": true,
     "report_url": "",
-    "_report_comment": "匿名统计端点(空=不上报, 部署 deploy/royalty_report_worker.js 后填入)。上报仅8个公开字段: 匿名install_id/版本/事件/是否纸面/池余额/累计分成/提现次数/时间戳, 不含API密钥与个人信息, 端点代码在仓库中可审计; 关闭统计与关闭分成同属商业授权范围",
+    "_report_comment": "匿名统计端点。默认(留空)上报至作者端点DEFAULT_REPORT_URL(代码内硬编码, 开箱即报); 可填自建端点覆盖(deploy/royalty_report_worker.js 一键部署)。上报仅8个公开字段: 匿名install_id/版本/事件/是否纸面/池余额/累计分成/提现次数/时间戳, 不含API密钥与个人信息, 端点代码在仓库中可审计; 关闭统计(report_enabled=false)与关闭分成同属商业授权范围",
     "report_interval_hours": 24
   },
   "agent": {

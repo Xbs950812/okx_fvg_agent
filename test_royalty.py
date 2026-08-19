@@ -409,23 +409,43 @@ class _PostCapture:
 
 
 def test_telemetry_heartbeat_fields_and_throttle(tmp_path, monkeypatch):
-    """心跳: 启动首轮即上报(8字段), 24h 内节流不再上报。"""
+    """心跳: 启动首轮即上报(8字段), 24h 内节流不再上报。
+    v3.3.1 起默认上报到 DEFAULT_REPORT_URL(开箱即报)。"""
     import royalty as roy
     cap = _PostCapture()
     monkeypatch.setattr(roy.requests, "post", cap)
-    m = make_mgr(tmp_path, report_url="http://x/report")
+    m = make_mgr(tmp_path)                   # 不传 report_url → 用默认端点
     m.maybe_withdraw(FakeClient())          # pool=0 < 阈值 → 仅心跳
     assert len(cap.sent) == 1
     url, payload = cap.sent[0]
-    assert url == "http://x/report"
+    assert url == roy.DEFAULT_REPORT_URL
     assert payload["event"] == "heartbeat"
     assert payload["install_id"]            # 匿名ID已生成
-    assert payload["version"] == "3.3.0"
+    assert payload["version"] == "3.3.1"
     assert payload["paper_mode"] is False
     assert "pool_usdt" in payload and "cumulative_royalty_usdt" in payload
     assert "withdrawals_count" in payload and "ts" in payload
     m.maybe_withdraw(FakeClient())          # 节流窗口内
     assert len(cap.sent) == 1
+
+
+def test_telemetry_default_url_override_and_disable(tmp_path, monkeypatch):
+    """report_url 可覆盖为自建端点; 显式置空回退默认端点。
+    v3.3.1: 空/缺省都回退 DEFAULT_REPORT_URL(统计为许可条件)。"""
+    import royalty as roy
+    cap = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap)
+    # 覆盖为自建端点
+    m = make_mgr(tmp_path, report_url="http://self-hosted/report")
+    m.maybe_withdraw(FakeClient())
+    assert cap.sent[0][0] == "http://self-hosted/report"
+    # 显式空串 → 仍回退默认端点(禁用统计需走 report_enabled=false)
+    # 注: 用新的 state 目录, 避免复用上一次的 last_report_ts 被节流
+    cap2 = _PostCapture()
+    monkeypatch.setattr(roy.requests, "post", cap2)
+    m2 = make_mgr(tmp_path / "fresh", report_url="")
+    m2.maybe_withdraw(FakeClient())
+    assert cap2.sent[0][0] == roy.DEFAULT_REPORT_URL
 
 
 def test_telemetry_paper_mode_still_heartbeats(tmp_path, monkeypatch):
@@ -440,11 +460,12 @@ def test_telemetry_paper_mode_still_heartbeats(tmp_path, monkeypatch):
 
 
 def test_telemetry_no_url_noop(tmp_path, monkeypatch):
-    """report_url 为空(默认) → 绝不发任何网络请求。"""
+    """report_enabled=false(默认true) → 绝不发任何网络请求。
+    v3.3.1 起端点有默认值, 禁用统计的唯一开关是 report_enabled。"""
     import royalty as roy
     cap = _PostCapture()
     monkeypatch.setattr(roy.requests, "post", cap)
-    m = make_mgr(tmp_path)
+    m = make_mgr(tmp_path, report_enabled=False)
     m.maybe_withdraw(FakeClient())
     assert cap.sent == []
 
